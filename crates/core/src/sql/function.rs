@@ -272,6 +272,14 @@ impl Function {
 						}
 					}
 				}
+
+				// Adjust context if run_as is present
+				let mut opt = opt.clone();
+				if let Some(run_as) = &val.run_as {
+					let auth = run_as.to_auth(ctx, &opt).await?;
+					opt = opt.with_auth(auth.into());
+				}
+
 				// Get the number of function arguments
 				let max_args_len = val.args.len();
 				// Track the number of required arguments
@@ -297,7 +305,7 @@ impl Function {
 				let a = stk
 					.scope(|scope| {
 						try_join_all(
-							x.iter().map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+							x.iter().map(|v| scope.run(|stk| v.compute(stk, ctx, &opt, doc))),
 						)
 					})
 					.await?;
@@ -309,7 +317,7 @@ impl Function {
 				}
 				let ctx = ctx.freeze();
 				// Run the custom function
-				let result = match stk.run(|stk| val.block.compute(stk, &ctx, opt, doc)).await {
+				let result = match stk.run(|stk| val.block.compute(stk, &ctx, &opt, doc)).await {
 					Err(Error::Return {
 						value,
 					}) => Ok(value),

@@ -6,7 +6,7 @@ use crate::sql::index::HnswParams;
 use crate::sql::statements::define::config::graphql::{GraphQLConfig, TableConfig};
 use crate::sql::statements::define::config::ConfigInner;
 use crate::sql::statements::define::DefineConfigStatement;
-use crate::sql::Value;
+use crate::sql::{RunAs, RunAsKind, Value};
 use crate::{
 	sql::{
 		access_type,
@@ -125,6 +125,7 @@ impl Parser<'_> {
 		Ok(res)
 	}
 
+	#[allow(clippy::if_same_then_else)]
 	pub async fn parse_define_function(
 		&mut self,
 		ctx: &mut Stk,
@@ -185,6 +186,33 @@ impl Parser<'_> {
 				t!("PERMISSIONS") => {
 					self.pop_peek();
 					res.permissions = ctx.run(|ctx| self.parse_permission_value(ctx)).await?;
+				}
+				t!("AS") => {
+					self.pop_peek();
+					let base = if self.eat(t!("ROOT")) {
+						Base::Root
+					} else if self.eat(t!("NAMESPACE")) {
+						Base::Ns
+					} else if self.eat(t!("DATABASE")) {
+						Base::Db
+					} else {
+						Base::Db // DATABASE is default level.
+					};
+					let kind = if self.eat(t!("ROLES")) {
+						let mut roles = vec![self.next_token_value()?];
+						while self.eat(t!(",")) {
+							roles.push(self.next_token_value()?);
+						}
+						RunAsKind::Roles(roles)
+					} else if self.eat(t!("USER")) {
+						RunAsKind::User(self.next_token_value()?)
+					} else {
+						unexpected!(self, self.peek(), "a token ROLES or USER")
+					};
+					res.run_as = Some(RunAs {
+						base,
+						kind,
+					});
 				}
 				_ => break,
 			}

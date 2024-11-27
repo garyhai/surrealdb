@@ -26,8 +26,8 @@ use crate::{
 		Algorithm, Array, Base, Block, Cond, Data, Datetime, Dir, Duration, Edges, Explain,
 		Expression, Fetch, Fetchs, Field, Fields, Future, Graph, Group, Groups, Id, Ident, Idiom,
 		Idioms, Index, Kind, Limit, Number, Object, Operator, Order, Output, Param, Part,
-		Permission, Permissions, Scoring, Split, Splits, Start, Statement, Strand, Subquery, Table,
-		TableType, Tables, Thing, Timeout, Uuid, Value, Values, Version, With,
+		Permission, Permissions, RunAs, Scoring, Split, Splits, Start, Statement, Strand, Subquery,
+		Table, TableType, Tables, Thing, Timeout, Uuid, Value, Values, Version, With,
 	},
 	syn::parser::{Parser, PartialResult},
 };
@@ -55,7 +55,7 @@ static SOURCE: &str = r#"
 	DEFINE DB a;
 	DEFINE FUNCTION fn::foo::bar($a: number, $b: array<bool,3>) {
 		RETURN a
-	} COMMENT 'test' PERMISSIONS FULL;
+	} COMMENT 'test' PERMISSIONS FULL AS ROLES tester, viewer;
 	DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM EDDSA KEY "foo" COMMENT "bar";
 	DEFINE PARAM $a VALUE { a: 1, "b": 3 } PERMISSIONS WHERE null;
 	DEFINE TABLE name DROP SCHEMAFUL CHANGEFEED 1s PERMISSIONS FOR SELECT WHERE a = 1 AS SELECT foo FROM bar GROUP BY foo;
@@ -204,6 +204,7 @@ fn statements() -> Vec<Statement> {
 			})]),
 			comment: Some(Strand("test".to_string())),
 			permissions: Permission::Full,
+			run_as: RunAs::as_roles(["tester", "viewer"]).into(),
 			if_not_exists: false,
 			overwrite: false,
 			returns: None,
