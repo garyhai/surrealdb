@@ -20,15 +20,15 @@ use crate::idx::planner::iterators::{
 use crate::idx::planner::knn::{KnnBruteForceResult, KnnPriorityList};
 use crate::idx::planner::plan::IndexOperator::Matches;
 use crate::idx::planner::plan::{IndexOperator, IndexOption, RangeValue};
-use crate::idx::planner::tree::{IdiomPosition, IndexRef, IndexesMap};
+use crate::idx::planner::tree::{IdiomPosition, IndexReference};
 use crate::idx::planner::IterationStage;
 use crate::idx::trees::mtree::MTreeIndex;
 use crate::idx::trees::store::hnsw::SharedHnswIndex;
 use crate::idx::IndexKeyBase;
-use crate::kvs::{Key, TransactionType};
+use crate::kvs::TransactionType;
 use crate::sql::index::{Distance, Index};
 use crate::sql::statements::DefineIndexStatement;
-use crate::sql::{Cond, Expression, Idiom, Number, Object, Table, Thing, Value};
+use crate::sql::{Array, Cond, Expression, Idiom, Number, Object, Table, Thing, Value};
 use num_traits::{FromPrimitive, ToPrimitive};
 use reblessive::tree::Stk;
 use rust_decimal::Decimal;
@@ -66,11 +66,10 @@ pub(crate) struct QueryExecutor(Arc<InnerQueryExecutor>);
 
 pub(super) struct InnerQueryExecutor {
 	table: String,
-	ft_map: HashMap<IndexRef, FtIndex>,
+	ft_map: HashMap<IndexReference, FtIndex>,
 	mr_entries: HashMap<MatchRef, FtEntry>,
 	exp_entries: HashMap<Arc<Expression>, FtEntry>,
 	it_entries: Vec<IteratorEntry>,
-	index_definitions: Vec<Arc<DefineIndexStatement>>,
 	mt_entries: HashMap<Arc<Expression>, MtEntry>,
 	hnsw_entries: HashMap<Arc<Expression>, HnswEntry>,
 	knn_bruteforce_entries: HashMap<Arc<Expression>, KnnBruteForceEntry>,
@@ -84,18 +83,16 @@ impl From<InnerQueryExecutor> for QueryExecutor {
 
 pub(super) enum IteratorEntry {
 	Single(Option<Arc<Expression>>, IndexOption),
-	Range(HashSet<Arc<Expression>>, IndexRef, RangeValue, RangeValue),
+	Range(HashSet<Arc<Expression>>, IndexReference, RangeValue, RangeValue),
 }
 
 impl IteratorEntry {
-	pub(super) fn explain(&self, ix_def: &[Arc<DefineIndexStatement>]) -> Value {
+	pub(super) fn explain(&self) -> Value {
 		match self {
-			Self::Single(_, io) => io.explain(ix_def),
+			Self::Single(_, io) => io.explain(),
 			Self::Range(_, ir, from, to) => {
 				let mut e = HashMap::default();
-				if let Some(ix) = ix_def.get(*ir as usize) {
-					e.insert("index", Value::from(ix.name.0.to_owned()));
-				}
+				e.insert("index", Value::from(ir.name.0.to_owned()));
 				e.insert("from", Value::from(from));
 				e.insert("to", Value::from(to));
 				Value::from(Object::from(e))
@@ -111,7 +108,7 @@ impl InnerQueryExecutor {
 		ctx: &Context,
 		opt: &Options,
 		table: &Table,
-		im: IndexesMap,
+		ios: Vec<(Arc<Expression>, IndexOption)>,
 		knns: KnnExpressions,
 		kbtes: KnnBruteForceExpressions,
 		knn_condition: Option<Cond>,
@@ -119,137 +116,114 @@ impl InnerQueryExecutor {
 		let mut mr_entries = HashMap::default();
 		let mut exp_entries = HashMap::default();
 		let mut ft_map = HashMap::default();
-		let mut mt_map: HashMap<IndexRef, MTreeIndex> = HashMap::default();
+		let mut mt_map: HashMap<IndexReference, MTreeIndex> = HashMap::default();
 		let mut mt_entries = HashMap::default();
-		let mut hnsw_map: HashMap<IndexRef, SharedHnswIndex> = HashMap::default();
+		let mut hnsw_map: HashMap<IndexReference, SharedHnswIndex> = HashMap::default();
 		let mut hnsw_entries = HashMap::default();
 		let mut knn_bruteforce_entries = HashMap::with_capacity(knns.len());
 		let knn_condition = knn_condition.map(Arc::new);
 
-		// Create all the instances of FtIndex
-		// Build the FtEntries and map them to Idioms and MatchRef
-		for (exp, io) in im.options {
-			let ix_ref = io.ix_ref();
-			if let Some(idx_def) = im.definitions.get(ix_ref as usize) {
-				match &idx_def.index {
-					Index::Search(p) => {
-						let ft_entry = match ft_map.entry(ix_ref) {
-							Entry::Occupied(e) => FtEntry::new(stk, ctx, opt, e.get(), io).await?,
+		// Create all the instances of index entries.
+		// Map them to Idioms and MatchRef
+		for (exp, io) in ios {
+			let ixr = io.ix_ref();
+			match &ixr.index {
+				Index::Search(p) => {
+					let ft_entry = match ft_map.entry(ixr.clone()) {
+						Entry::Occupied(e) => FtEntry::new(stk, ctx, opt, e.get(), io).await?,
+						Entry::Vacant(e) => {
+							let (ns, db) = opt.ns_db()?;
+							let ikb = IndexKeyBase::new(ns, db, e.key())?;
+							let ft = FtIndex::new(
+								ctx,
+								opt,
+								p.az.as_str(),
+								ikb,
+								p,
+								TransactionType::Read,
+							)
+							.await?;
+							let fte = FtEntry::new(stk, ctx, opt, &ft, io).await?;
+							e.insert(ft);
+							fte
+						}
+					};
+					if let Some(e) = ft_entry {
+						if let Matches(_, Some(mr)) = e.0.index_option.op() {
+							if mr_entries.insert(*mr, e.clone()).is_some() {
+								return Err(Error::DuplicatedMatchRef {
+									mr: *mr,
+								});
+							}
+						}
+						exp_entries.insert(exp, e);
+					}
+				}
+				Index::MTree(p) => {
+					if let IndexOperator::Knn(a, k) = io.op() {
+						let entry = match mt_map.entry(ixr.clone()) {
+							Entry::Occupied(e) => {
+								MtEntry::new(stk, ctx, opt, e.get(), a, *k, knn_condition.clone())
+									.await?
+							}
 							Entry::Vacant(e) => {
-								let ikb = IndexKeyBase::new(opt.ns()?, opt.db()?, idx_def)?;
-								let ft = FtIndex::new(
-									ctx,
-									opt,
-									p.az.as_str(),
-									ikb,
-									p,
-									TransactionType::Read,
-								)
-								.await?;
-								let fte = FtEntry::new(stk, ctx, opt, &ft, io).await?;
-								e.insert(ft);
-								fte
+								let (ns, db) = opt.ns_db()?;
+								let ikb = IndexKeyBase::new(ns, db, e.key())?;
+								let tx = ctx.tx();
+								let mt =
+									MTreeIndex::new(&tx, ikb, p, TransactionType::Read).await?;
+								drop(tx);
+								let entry =
+									MtEntry::new(stk, ctx, opt, &mt, a, *k, knn_condition.clone())
+										.await?;
+								e.insert(mt);
+								entry
 							}
 						};
-						if let Some(e) = ft_entry {
-							if let Matches(_, Some(mr)) = e.0.index_option.op() {
-								if mr_entries.insert(*mr, e.clone()).is_some() {
-									return Err(Error::DuplicatedMatchRef {
-										mr: *mr,
-									});
-								}
-							}
-							exp_entries.insert(exp, e);
-						}
+						mt_entries.insert(exp, entry);
 					}
-					Index::MTree(p) => {
-						if let IndexOperator::Knn(a, k) = io.op() {
-							let entry = match mt_map.entry(ix_ref) {
-								Entry::Occupied(e) => {
-									MtEntry::new(
-										stk,
-										ctx,
-										opt,
-										e.get(),
-										a,
-										*k,
-										knn_condition.clone(),
-									)
-									.await?
-								}
-								Entry::Vacant(e) => {
-									let ikb = IndexKeyBase::new(opt.ns()?, opt.db()?, idx_def)?;
-									let tx = ctx.tx();
-									let mt = MTreeIndex::new(
-										ctx.get_index_stores(),
-										&tx,
-										ikb,
-										p,
-										TransactionType::Read,
-									)
-									.await?;
-									drop(tx);
-									let entry = MtEntry::new(
-										stk,
-										ctx,
-										opt,
-										&mt,
-										a,
-										*k,
-										knn_condition.clone(),
-									)
-									.await?;
-									e.insert(mt);
-									entry
-								}
-							};
-							mt_entries.insert(exp, entry);
-						}
-					}
-					Index::Hnsw(p) => {
-						if let IndexOperator::Ann(a, k, ef) = io.op() {
-							let entry = match hnsw_map.entry(ix_ref) {
-								Entry::Occupied(e) => {
-									HnswEntry::new(
-										stk,
-										ctx,
-										opt,
-										e.get().clone(),
-										a,
-										*k,
-										*ef,
-										knn_condition.clone(),
-									)
-									.await?
-								}
-								Entry::Vacant(e) => {
-									let hnsw = ctx
-										.get_index_stores()
-										.get_index_hnsw(ctx, opt, idx_def, p)
-										.await?;
-									// Ensure the local HNSW index is up to date with the KVS
-									hnsw.write().await.check_state(&ctx.tx()).await?;
-									// Now we can execute the request
-									let entry = HnswEntry::new(
-										stk,
-										ctx,
-										opt,
-										hnsw.clone(),
-										a,
-										*k,
-										*ef,
-										knn_condition.clone(),
-									)
-									.await?;
-									e.insert(hnsw);
-									entry
-								}
-							};
-							hnsw_entries.insert(exp, entry);
-						}
-					}
-					_ => {}
 				}
+				Index::Hnsw(p) => {
+					if let IndexOperator::Ann(a, k, ef) = io.op() {
+						let entry = match hnsw_map.entry(ixr.clone()) {
+							Entry::Occupied(e) => {
+								HnswEntry::new(
+									stk,
+									ctx,
+									opt,
+									e.get().clone(),
+									a,
+									*k,
+									*ef,
+									knn_condition.clone(),
+								)
+								.await?
+							}
+							Entry::Vacant(e) => {
+								let hnsw =
+									ctx.get_index_stores().get_index_hnsw(ctx, opt, ixr, p).await?;
+								// Ensure the local HNSW index is up to date with the KVS
+								hnsw.write().await.check_state(&ctx.tx()).await?;
+								// Now we can execute the request
+								let entry = HnswEntry::new(
+									stk,
+									ctx,
+									opt,
+									hnsw.clone(),
+									a,
+									*k,
+									*ef,
+									knn_condition.clone(),
+								)
+								.await?;
+								e.insert(hnsw);
+								entry
+							}
+						};
+						hnsw_entries.insert(exp, entry);
+					}
+				}
+				_ => {}
 			}
 		}
 
@@ -264,7 +238,6 @@ impl InnerQueryExecutor {
 			mr_entries,
 			exp_entries,
 			it_entries: Vec::new(),
-			index_definitions: im.definitions,
 			mt_entries,
 			hnsw_entries,
 			knn_bruteforce_entries,
@@ -324,17 +297,17 @@ impl QueryExecutor {
 	}
 
 	/// Returns `true` if the expression is matching the current iterator.
-	pub(crate) fn is_iterator_expression(&self, irf: IteratorRef, exp: &Expression) -> bool {
-		match self.0.it_entries.get(irf as usize) {
+	pub(crate) fn is_iterator_expression(&self, ir: IteratorRef, exp: &Expression) -> bool {
+		match self.0.it_entries.get(ir) {
 			Some(IteratorEntry::Single(Some(e), ..)) => exp.eq(e.as_ref()),
 			Some(IteratorEntry::Range(es, ..)) => es.contains(exp),
 			_ => false,
 		}
 	}
 
-	pub(crate) fn explain(&self, itr: IteratorRef) -> Value {
-		match self.0.it_entries.get(itr as usize) {
-			Some(ie) => ie.explain(&self.0.index_definitions),
+	pub(crate) fn explain(&self, ir: IteratorRef) -> Value {
+		match self.0.it_entries.get(ir) {
+			Some(ie) => ie.explain(),
 			None => Value::None,
 		}
 	}
@@ -351,13 +324,13 @@ impl QueryExecutor {
 	pub(crate) async fn new_iterator(
 		&self,
 		opt: &Options,
-		irf: IteratorRef,
+		ir: IteratorRef,
 	) -> Result<Option<ThingIterator>, Error> {
-		if let Some(it_entry) = self.0.it_entries.get(irf as usize) {
+		if let Some(it_entry) = self.0.it_entries.get(ir) {
 			match it_entry {
-				IteratorEntry::Single(_, io) => self.new_single_iterator(opt, irf, io).await,
+				IteratorEntry::Single(_, io) => self.new_single_iterator(opt, ir, io).await,
 				IteratorEntry::Range(_, ixr, from, to) => {
-					Ok(self.new_range_iterator(opt, *ixr, from, to)?)
+					Ok(self.new_range_iterator(ir, opt, ixr, from, to)?)
 				}
 			}
 		} else {
@@ -371,82 +344,127 @@ impl QueryExecutor {
 		irf: IteratorRef,
 		io: &IndexOption,
 	) -> Result<Option<ThingIterator>, Error> {
-		if let Some(ix) = self.get_index_def(io.ix_ref()) {
-			match ix.index {
-				Index::Idx => Ok(self.new_index_iterator(opt, irf, ix.clone(), io.clone()).await?),
-				Index::Uniq => Ok(self.new_unique_index_iterator(opt, irf, ix, io.clone()).await?),
-				Index::Search {
-					..
-				} => self.new_search_index_iterator(irf, io.clone()).await,
-				Index::MTree(_) => Ok(self.new_mtree_index_knn_iterator(irf)),
-				Index::Hnsw(_) => Ok(self.new_hnsw_index_ann_iterator(irf)),
-			}
-		} else {
-			Ok(None)
+		let ixr = io.ix_ref();
+		match ixr.index {
+			Index::Idx => Ok(self.new_index_iterator(opt, irf, ixr, io.clone()).await?),
+			Index::Uniq => Ok(self.new_unique_index_iterator(opt, irf, ixr, io.clone()).await?),
+			Index::Search {
+				..
+			} => self.new_search_index_iterator(irf, io.clone()).await,
+			Index::MTree(_) => Ok(self.new_mtree_index_knn_iterator(irf)),
+			Index::Hnsw(_) => Ok(self.new_hnsw_index_ann_iterator(irf)),
 		}
 	}
 
 	async fn new_index_iterator(
 		&self,
 		opt: &Options,
-		irf: IteratorRef,
-		ix: Arc<DefineIndexStatement>,
+		ir: IteratorRef,
+		ix: &IndexReference,
 		io: IndexOption,
 	) -> Result<Option<ThingIterator>, Error> {
 		Ok(match io.op() {
-			IndexOperator::Equality(value) | IndexOperator::Exactness(value) => {
-				if let Value::Number(n) = value.as_ref() {
-					let values = Self::get_equal_number_variants(n);
-					if values.len() == 1 {
-						Some(Self::new_index_equal_iterator(irf, opt, &ix, &values[0])?)
-					} else {
-						Some(Self::new_multiple_index_equal_iterators(irf, opt, &ix, values)?)
-					}
+			IndexOperator::Equality(value) => {
+				let variants = Self::get_equal_variants_from_value(value);
+				if variants.len() == 1 {
+					Some(Self::new_index_equal_iterator(ir, opt, ix, &variants[0])?)
 				} else {
-					Some(Self::new_index_equal_iterator(irf, opt, &ix, value)?)
+					let (ns, db) = opt.ns_db()?;
+					Some(ThingIterator::IndexUnion(IndexUnionThingIterator::new(
+						ir, ns, db, ix, &variants,
+					)?))
 				}
 			}
-			IndexOperator::Union(value) => Some(ThingIterator::IndexUnion(
-				IndexUnionThingIterator::new(irf, opt.ns()?, opt.db()?, &ix, value),
-			)),
+			IndexOperator::Union(values) => {
+				let variants = Self::get_equal_variants_from_values(values);
+				let (ns, db) = opt.ns_db()?;
+				Some(ThingIterator::IndexUnion(IndexUnionThingIterator::new(
+					ir, ns, db, ix, &variants,
+				)?))
+			}
 			IndexOperator::Join(ios) => {
-				let iterators = self.build_iterators(opt, irf, ios).await?;
-				let index_join = Box::new(IndexJoinThingIterator::new(irf, opt, ix, iterators)?);
+				let iterators = self.build_iterators(opt, ir, ios).await?;
+				let index_join =
+					Box::new(IndexJoinThingIterator::new(ir, opt, ix.clone(), iterators)?);
 				Some(ThingIterator::IndexJoin(index_join))
 			}
-			IndexOperator::Order => Some(ThingIterator::IndexRange(
-				IndexRangeThingIterator::full_range(irf, opt.ns()?, opt.db()?, &ix.what, &ix.name),
-			)),
+			IndexOperator::Order => {
+				let (ns, db) = opt.ns_db()?;
+				Some(ThingIterator::IndexRange(IndexRangeThingIterator::full_range(
+					ir, ns, db, ix,
+				)?))
+			}
 			_ => None,
 		})
+	}
+
+	fn get_equal_variants_from_value(value: &Value) -> Vec<Array> {
+		let mut variants = Vec::with_capacity(1);
+		Self::generate_variants_from_value(value, &mut variants);
+		variants
+	}
+
+	fn get_equal_variants_from_values(values: &Value) -> Vec<Array> {
+		if let Value::Array(a) = values {
+			let mut variants = Vec::with_capacity(a.len());
+			for v in &a.0 {
+				Self::generate_variants_from_value(v, &mut variants);
+			}
+			variants
+		} else {
+			vec![]
+		}
+	}
+
+	fn generate_variants_from_value(value: &Value, variants: &mut Vec<Array>) {
+		if let Value::Array(a) = value {
+			Self::generate_variants_from_array(a, variants);
+		} else {
+			let a = Array(vec![value.clone()]);
+			Self::generate_variants_from_array(&a, variants)
+		}
+	}
+
+	fn generate_variants_from_array(array: &Array, variants: &mut Vec<Array>) {
+		let col_count = array.len();
+		let mut cols_values = Vec::with_capacity(col_count);
+		for value in array.iter() {
+			let value_variants = if let Value::Number(n) = value {
+				Self::get_equal_number_variants(n)
+			} else {
+				vec![value.clone()]
+			};
+			cols_values.push(value_variants);
+		}
+		Self::generate_variant(0, vec![], &cols_values, variants);
+	}
+
+	fn generate_variant(
+		col: usize,
+		variant: Vec<Value>,
+		cols_values: &[Vec<Value>],
+		variants: &mut Vec<Array>,
+	) {
+		if let Some(values) = cols_values.get(col) {
+			let col = col + 1;
+			for value in values {
+				let mut current_variant = variant.clone();
+				current_variant.push(value.clone());
+				Self::generate_variant(col, current_variant, cols_values, variants);
+			}
+		} else {
+			variants.push(Array(variant));
+		}
 	}
 
 	fn new_index_equal_iterator(
 		irf: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
-		value: &Value,
+		array: &Array,
 	) -> Result<ThingIterator, Error> {
-		Ok(ThingIterator::IndexEqual(IndexEqualThingIterator::new(
-			irf,
-			opt.ns()?,
-			opt.db()?,
-			ix,
-			value,
-		)))
-	}
-
-	fn new_multiple_index_equal_iterators(
-		irf: IteratorRef,
-		opt: &Options,
-		ix: &DefineIndexStatement,
-		values: Vec<Value>,
-	) -> Result<ThingIterator, Error> {
-		let mut iterators = VecDeque::with_capacity(values.len());
-		for value in values {
-			iterators.push_back(Self::new_index_equal_iterator(irf, opt, ix, &value)?);
-		}
-		Ok(ThingIterator::Multiples(Box::new(MultipleIterators::new(iterators))))
+		let (ns, db) = opt.ns_db()?;
+		Ok(ThingIterator::IndexEqual(IndexEqualThingIterator::new(irf, ns, db, ix, array)?))
 	}
 
 	/// This function takes a reference to a `Number` enum and a conversion function `float_to_int`.
@@ -669,55 +687,50 @@ impl QueryExecutor {
 
 	fn new_range_iterator(
 		&self,
+		ir: IteratorRef,
 		opt: &Options,
-		ir: IndexRef,
+		ix: &DefineIndexStatement,
 		from: &RangeValue,
 		to: &RangeValue,
 	) -> Result<Option<ThingIterator>, Error> {
-		if let Some(ix) = self.get_index_def(ir) {
-			match ix.index {
-				Index::Idx => {
-					let ranges = Self::get_ranges_variants(from, to);
-					if let Some(ranges) = ranges {
-						if ranges.len() == 1 {
-							return Ok(Some(Self::new_index_range_iterator(
-								ir, opt, ix, &ranges[0],
-							)?));
-						} else {
-							return Ok(Some(Self::new_multiple_index_range_iterator(
-								ir, opt, ix, &ranges,
-							)?));
-						}
+		match ix.index {
+			Index::Idx => {
+				let ranges = Self::get_ranges_variants(from, to);
+				if let Some(ranges) = ranges {
+					if ranges.len() == 1 {
+						return Ok(Some(Self::new_index_range_iterator(ir, opt, ix, &ranges[0])?));
+					} else {
+						return Ok(Some(Self::new_multiple_index_range_iterator(
+							ir, opt, ix, &ranges,
+						)?));
 					}
-					return Ok(Some(Self::new_index_range_iterator(
-						ir,
-						opt,
-						ix,
-						&IteratorRange::new_ref(ValueType::None, from, to),
-					)?));
 				}
-				Index::Uniq => {
-					let ranges = Self::get_ranges_variants(from, to);
-					if let Some(ranges) = ranges {
-						if ranges.len() == 1 {
-							return Ok(Some(Self::new_unique_range_iterator(
-								ir, opt, ix, &ranges[0],
-							)?));
-						} else {
-							return Ok(Some(Self::new_multiple_unique_range_iterator(
-								ir, opt, ix, &ranges,
-							)?));
-						}
-					}
-					return Ok(Some(Self::new_unique_range_iterator(
-						ir,
-						opt,
-						ix,
-						&IteratorRange::new_ref(ValueType::None, from, to),
-					)?));
-				}
-				_ => {}
+				return Ok(Some(Self::new_index_range_iterator(
+					ir,
+					opt,
+					ix,
+					&IteratorRange::new_ref(ValueType::None, from, to),
+				)?));
 			}
+			Index::Uniq => {
+				let ranges = Self::get_ranges_variants(from, to);
+				if let Some(ranges) = ranges {
+					if ranges.len() == 1 {
+						return Ok(Some(Self::new_unique_range_iterator(ir, opt, ix, &ranges[0])?));
+					} else {
+						return Ok(Some(Self::new_multiple_unique_range_iterator(
+							ir, opt, ix, &ranges,
+						)?));
+					}
+				}
+				return Ok(Some(Self::new_unique_range_iterator(
+					ir,
+					opt,
+					ix,
+					&IteratorRange::new_ref(ValueType::None, from, to),
+				)?));
+			}
+			_ => {}
 		}
 		Ok(None)
 	}
@@ -741,39 +754,29 @@ impl QueryExecutor {
 	}
 
 	fn new_index_range_iterator(
-		ir: IndexRef,
+		ir: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
 		range: &IteratorRange,
 	) -> Result<ThingIterator, Error> {
-		Ok(ThingIterator::IndexRange(IndexRangeThingIterator::new(
-			ir,
-			opt.ns()?,
-			opt.db()?,
-			&ix.what,
-			&ix.name,
-			range,
-		)))
+		let (ns, db) = opt.ns_db()?;
+		Ok(ThingIterator::IndexRange(IndexRangeThingIterator::new(ir, ns, db, ix, range)?))
 	}
 
 	fn new_unique_range_iterator(
-		ir: IndexRef,
+		ir: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
 		range: &IteratorRange<'_>,
 	) -> Result<ThingIterator, Error> {
+		let (ns, db) = opt.ns_db()?;
 		Ok(ThingIterator::UniqueRange(UniqueRangeThingIterator::new(
-			ir,
-			opt.ns()?,
-			opt.db()?,
-			&ix.what,
-			&ix.name,
-			range,
-		)))
+			ir, ns, db, &ix.what, &ix.name, range,
+		)?))
 	}
 
 	fn new_multiple_index_range_iterator(
-		ir: IndexRef,
+		ir: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
 		ranges: &[IteratorRange],
@@ -786,7 +789,7 @@ impl QueryExecutor {
 	}
 
 	fn new_multiple_unique_range_iterator(
-		ir: IndexRef,
+		ir: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
 		ranges: &[IteratorRange<'_>],
@@ -802,34 +805,38 @@ impl QueryExecutor {
 		&self,
 		opt: &Options,
 		irf: IteratorRef,
-		ix: &Arc<DefineIndexStatement>,
+		ixr: &IndexReference,
 		io: IndexOption,
 	) -> Result<Option<ThingIterator>, Error> {
 		Ok(match io.op() {
-			IndexOperator::Equality(value) | IndexOperator::Exactness(value) => {
-				if let Value::Number(n) = value.as_ref() {
-					let values = Self::get_equal_number_variants(n);
-					if values.len() == 1 {
-						Some(Self::new_unique_equal_iterator(irf, opt, ix, &values[0])?)
-					} else {
-						Some(Self::new_multiple_unique_equal_iterators(irf, opt, ix, values)?)
-					}
+			IndexOperator::Equality(values) => {
+				let variants = Self::get_equal_variants_from_value(values);
+				if variants.len() == 1 {
+					Some(Self::new_unique_equal_iterator(irf, opt, ixr, &variants[0])?)
 				} else {
-					Some(Self::new_unique_equal_iterator(irf, opt, ix, value)?)
+					Some(ThingIterator::UniqueUnion(UniqueUnionThingIterator::new(
+						irf, opt, ixr, &variants,
+					)?))
 				}
 			}
-			IndexOperator::Union(value) => Some(ThingIterator::UniqueUnion(
-				UniqueUnionThingIterator::new(irf, opt, ix, value)?,
-			)),
+			IndexOperator::Union(values) => {
+				let variants = Self::get_equal_variants_from_values(values);
+				Some(ThingIterator::UniqueUnion(UniqueUnionThingIterator::new(
+					irf, opt, ixr, &variants,
+				)?))
+			}
 			IndexOperator::Join(ios) => {
 				let iterators = self.build_iterators(opt, irf, ios).await?;
 				let unique_join =
-					Box::new(UniqueJoinThingIterator::new(irf, opt, ix.clone(), iterators)?);
+					Box::new(UniqueJoinThingIterator::new(irf, opt, ixr.clone(), iterators)?);
 				Some(ThingIterator::UniqueJoin(unique_join))
 			}
-			IndexOperator::Order => Some(ThingIterator::UniqueRange(
-				UniqueRangeThingIterator::full_range(irf, opt.ns()?, opt.db()?, ix),
-			)),
+			IndexOperator::Order => {
+				let (ns, db) = opt.ns_db()?;
+				Some(ThingIterator::UniqueRange(UniqueRangeThingIterator::full_range(
+					irf, ns, db, ixr,
+				)?))
+			}
 			_ => None,
 		})
 	}
@@ -838,54 +845,30 @@ impl QueryExecutor {
 		irf: IteratorRef,
 		opt: &Options,
 		ix: &DefineIndexStatement,
-		value: &Value,
+		array: &Array,
 	) -> Result<ThingIterator, Error> {
+		let (ns, db) = opt.ns_db()?;
 		if ix.cols.len() > 1 {
 			// If the index is unique and the index is a composite index,
 			// then we have the opportunity to iterate on the first column of the index
 			// and consider it as a standard index (rather than a unique one)
-			Ok(ThingIterator::IndexEqual(IndexEqualThingIterator::new(
-				irf,
-				opt.ns()?,
-				opt.db()?,
-				ix,
-				value,
-			)))
+			Ok(ThingIterator::IndexEqual(IndexEqualThingIterator::new(irf, ns, db, ix, array)?))
 		} else {
-			Ok(ThingIterator::UniqueEqual(UniqueEqualThingIterator::new(
-				irf,
-				opt.ns()?,
-				opt.db()?,
-				ix,
-				value,
-			)))
+			Ok(ThingIterator::UniqueEqual(UniqueEqualThingIterator::new(irf, ns, db, ix, array)?))
 		}
-	}
-
-	fn new_multiple_unique_equal_iterators(
-		irf: IteratorRef,
-		opt: &Options,
-		ix: &DefineIndexStatement,
-		values: Vec<Value>,
-	) -> Result<ThingIterator, Error> {
-		let mut iterators = VecDeque::with_capacity(values.len());
-		for value in values {
-			iterators.push_back(Self::new_unique_equal_iterator(irf, opt, ix, &value)?);
-		}
-		Ok(ThingIterator::Multiples(Box::new(MultipleIterators::new(iterators))))
 	}
 
 	async fn new_search_index_iterator(
 		&self,
-		irf: IteratorRef,
+		ir: IteratorRef,
 		io: IndexOption,
 	) -> Result<Option<ThingIterator>, Error> {
-		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(irf as usize) {
+		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(ir) {
 			if let Matches(_, _) = io.op() {
-				if let Some(fti) = self.0.ft_map.get(&io.ix_ref()) {
+				if let Some(fti) = self.0.ft_map.get(io.ix_ref()) {
 					if let Some(fte) = self.0.exp_entries.get(exp) {
 						let it =
-							MatchesThingIterator::new(irf, fti, fte.0.terms_docs.clone()).await?;
+							MatchesThingIterator::new(ir, fti, fte.0.terms_docs.clone()).await?;
 						return Ok(Some(ThingIterator::Matches(it)));
 					}
 				}
@@ -894,20 +877,20 @@ impl QueryExecutor {
 		Ok(None)
 	}
 
-	fn new_mtree_index_knn_iterator(&self, irf: IteratorRef) -> Option<ThingIterator> {
-		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(irf as usize) {
+	fn new_mtree_index_knn_iterator(&self, ir: IteratorRef) -> Option<ThingIterator> {
+		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(ir) {
 			if let Some(mte) = self.0.mt_entries.get(exp) {
-				let it = KnnIterator::new(irf, mte.res.clone());
+				let it = KnnIterator::new(ir, mte.res.clone());
 				return Some(ThingIterator::Knn(it));
 			}
 		}
 		None
 	}
 
-	fn new_hnsw_index_ann_iterator(&self, irf: IteratorRef) -> Option<ThingIterator> {
-		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(irf as usize) {
+	fn new_hnsw_index_ann_iterator(&self, ir: IteratorRef) -> Option<ThingIterator> {
+		if let Some(IteratorEntry::Single(Some(exp), ..)) = self.0.it_entries.get(ir) {
 			if let Some(he) = self.0.hnsw_entries.get(exp) {
-				let it = KnnIterator::new(irf, he.res.clone());
+				let it = KnnIterator::new(ir, he.res.clone());
 				return Some(ThingIterator::Knn(it));
 			}
 		}
@@ -929,10 +912,6 @@ impl QueryExecutor {
 		Ok(iterators)
 	}
 
-	fn get_index_def(&self, ir: IndexRef) -> Option<&Arc<DefineIndexStatement>> {
-		self.0.index_definitions.get(ir as usize)
-	}
-
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn matches(
 		&self,
@@ -945,17 +924,16 @@ impl QueryExecutor {
 		r: Value,
 	) -> Result<bool, Error> {
 		if let Some(ft) = self.0.exp_entries.get(exp) {
-			if let Some(ix_def) = self.get_index_def(ft.0.index_option.ix_ref()) {
-				if self.0.table.eq(&ix_def.what.0) {
-					return self.matches_with_doc_id(ctx, thg, ft).await;
-				}
+			let ix = ft.0.index_option.ix_ref();
+			if self.0.table.eq(&ix.what.0) {
+				return self.matches_with_doc_id(ctx, thg, ft).await;
 			}
 			return self.matches_with_value(stk, ctx, opt, ft, l, r).await;
 		}
 
 		// If no previous case were successful, we end up with a user error
 		Err(Error::NoIndexFoundForMatch {
-			value: exp.to_string(),
+			exp: exp.to_string(),
 		})
 	}
 
@@ -965,7 +943,8 @@ impl QueryExecutor {
 		thg: &Thing,
 		ft: &FtEntry,
 	) -> Result<bool, Error> {
-		let doc_key: Key = thg.into();
+		// TODO ask emmanual
+		let doc_key = revision::to_vec(thg)?;
 		let tx = ctx.tx();
 		let di = ft.0.doc_ids.read().await;
 		let doc_id = di.get_doc_id(&tx, doc_key).await?;
@@ -1028,7 +1007,7 @@ impl QueryExecutor {
 
 	fn get_ft_entry_and_index(&self, match_ref: &Value) -> Option<(&FtEntry, &FtIndex)> {
 		if let Some(e) = self.get_ft_entry(match_ref) {
-			if let Some(ft) = self.0.ft_map.get(&e.0.index_option.ix_ref()) {
+			if let Some(ft) = self.0.ft_map.get(e.0.index_option.ix_ref()) {
 				return Some((e, ft));
 			}
 		}
@@ -1043,11 +1022,11 @@ impl QueryExecutor {
 		doc: &Value,
 	) -> Result<Value, Error> {
 		if let Some((e, ft)) = self.get_ft_entry_and_index(hlp.match_ref()) {
-			let tx = ctx.tx();
-			let res = ft
-				.highlight(&tx, thg, &e.0.query_terms_list, hlp, e.0.index_option.id_ref(), doc)
-				.await;
-			return res;
+			if let Some(id) = e.0.index_option.id_ref() {
+				let tx = ctx.tx();
+				let res = ft.highlight(&tx, thg, &e.0.query_terms_list, hlp, id, doc).await;
+				return res;
+			}
 		}
 		Ok(Value::None)
 	}
@@ -1083,7 +1062,7 @@ impl QueryExecutor {
 					None
 				};
 				if doc_id.is_none() {
-					let key: Key = rid.into();
+					let key = revision::to_vec(rid)?;
 					let di = e.0.doc_ids.read().await;
 					doc_id = di.get_doc_id(&tx, key).await?;
 					drop(di);

@@ -28,10 +28,10 @@ use surrealdb_core::sql::{
 };
 use uuid::Uuid;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use tokio::spawn;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 use wasm_bindgen_futures::spawn_local as spawn;
 
 const ID: &str = "id";
@@ -88,7 +88,7 @@ where
 			Resource::Unspecified => return Err(Error::LiveOnUnspecified.into()),
 		}
 		let query =
-			Query::new(client.clone(), vec![Statement::Live(stmt)], Default::default(), false);
+			Query::normal(client.clone(), vec![Statement::Live(stmt)], Default::default(), false);
 		let CoreValue::Uuid(id) = query.await?.take::<Value>(0)?.into_inner() else {
 			return Err(Error::InternalError(
 				"successufull live query didn't return a uuid".to_string(),

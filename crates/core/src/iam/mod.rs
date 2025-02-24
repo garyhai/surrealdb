@@ -2,6 +2,7 @@ use cedar_policy::Context;
 pub use entities::Level;
 use thiserror::Error;
 
+pub mod access;
 pub mod auth;
 pub mod base;
 pub mod check;
@@ -11,6 +12,7 @@ pub mod issue;
 #[cfg(feature = "jwks")]
 pub mod jwks;
 pub mod policies;
+pub mod reset;
 pub mod signin;
 pub mod signup;
 pub mod token;

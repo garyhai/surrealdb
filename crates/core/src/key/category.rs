@@ -68,6 +68,8 @@ pub enum Category {
 	DatabaseAccessRoot,
 	/// crate::key::database::access::gr     /*{ns}*{db}*ac!gr{gr}
 	DatabaseAccessGrant,
+	/// crate::key::database::ap             /*{ns}*{db}!ap{ap}
+	DatabaseApi,
 	/// crate::key::database::az             /*{ns}*{db}!az{az}
 	DatabaseAnalyzer,
 	/// crate::key::database::fc             /*{ns}*{db}!fn{fc}
@@ -155,8 +157,13 @@ pub enum Category {
 	///
 	/// ------------------------------
 	///
-	/// crate::key::graph                    /*{ns}*{db}*{tb}~{id}{eg}{fk}
+	/// crate::key::graph                    /*{ns}*{db}*{tb}~{id}{eg}{ft}{fk}
 	Graph,
+	///
+	/// ------------------------------
+	///
+	/// crate::key::ref                      /*{ns}*{db}*{tb}&{id}{ft}{ff}{fk}
+	Ref,
 }
 
 impl Display for Category {
@@ -184,6 +191,7 @@ impl Display for Category {
 			Self::DatabaseAccess => "DatabaseAccess",
 			Self::DatabaseAccessRoot => "DatabaseAccessRoot",
 			Self::DatabaseAccessGrant => "DatabaseAccessGrant",
+			Self::DatabaseApi => "DatabaseApi",
 			Self::DatabaseAnalyzer => "DatabaseAnalyzer",
 			Self::DatabaseFunction => "DatabaseFunction",
 			Self::DatabaseModel => "DatabaseModel",
@@ -222,6 +230,7 @@ impl Display for Category {
 			Self::ChangeFeed => "ChangeFeed",
 			Self::Thing => "Thing",
 			Self::Graph => "Graph",
+			Self::Ref => "Ref",
 		};
 		write!(f, "{}", name)
 	}

@@ -247,18 +247,6 @@ transparent_wrapper!(
 );
 impl_serialize_wrapper!(Number);
 
-impl Number {
-	#[doc(hidden)]
-	pub fn cource_into_i64(self) -> Option<i64> {
-		match self.0 {
-			CoreNumber::Int(x) => Some(x),
-			CoreNumber::Float(x) if x.fract() == x => Some(x as i64),
-			CoreNumber::Decimal(x) => x.try_into().ok(),
-			_ => None,
-		}
-	}
-}
-
 transparent_wrapper!(
 	#[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 	pub struct Value(pub(crate) CoreValue)
@@ -349,6 +337,7 @@ pub enum Action {
 }
 
 impl Action {
+	#[allow(dead_code)] // Used by other engines except the HTTP one
 	pub(crate) fn from_core(action: CoreAction) -> Self {
 		match action {
 			CoreAction::Create => Self::Create,

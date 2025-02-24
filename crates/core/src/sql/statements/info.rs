@@ -5,7 +5,8 @@ use crate::err::Error;
 use crate::iam::Action;
 use crate::iam::ResourceKind;
 use crate::sql::{Base, Ident, Object, Value, Version};
-use derive::Store;
+use crate::sys::INFORMATION;
+
 use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use std::fmt;
 use std::sync::Arc;
 
 #[revisioned(revision = 5)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub enum InfoStatement {
@@ -60,6 +61,7 @@ impl InfoStatement {
 						"accesses".to_string() => process(txn.all_root_accesses().await?.iter().map(|v| v.redacted()).collect()),
 						"namespaces".to_string() => process(txn.all_ns().await?),
 						"nodes".to_string() => process(txn.all_nodes().await?),
+						"system".to_string() => system().await,
 						"users".to_string() => process(txn.all_root_users().await?),
 					}),
 					false => Value::from(map! {
@@ -84,13 +86,14 @@ impl InfoStatement {
 							}
 							out.into()
 						},
+						"system".to_string() => system().await,
 						"users".to_string() => {
 							let mut out = Object::default();
 							for v in txn.all_root_users().await?.iter() {
 								out.insert(v.name.to_raw(), v.to_string().into());
 							}
 							out.into()
-						},
+						}
 					}),
 				})
 			}
@@ -137,8 +140,7 @@ impl InfoStatement {
 				// Allowed to run?
 				opt.is_allowed(Action::View, ResourceKind::Any, &Base::Db)?;
 				// Get the NS and DB
-				let ns = opt.ns()?;
-				let db = opt.db()?;
+				let (ns, db) = opt.ns_db()?;
 				// Convert the version to u64 if present
 				let version = match version {
 					Some(v) => Some(v.compute(stk, ctx, opt, None).await?),
@@ -150,6 +152,7 @@ impl InfoStatement {
 				Ok(match structured {
 					true => Value::from(map! {
 						"accesses".to_string() => process(txn.all_db_accesses(ns, db).await?.iter().map(|v| v.redacted()).collect()),
+						"apis".to_string() => process(txn.all_db_apis(ns, db).await?),
 						"analyzers".to_string() => process(txn.all_db_analyzers(ns, db).await?),
 						"functions".to_string() => process(txn.all_db_functions(ns, db).await?),
 						"models".to_string() => process(txn.all_db_models(ns, db).await?),
@@ -163,6 +166,13 @@ impl InfoStatement {
 							let mut out = Object::default();
 							for v in txn.all_db_accesses(ns, db).await?.iter().map(|v| v.redacted()) {
 								out.insert(v.name.to_raw(), v.to_string().into());
+							}
+							out.into()
+						},
+						"apis".to_string() => {
+							let mut out = Object::default();
+							for v in txn.all_db_apis(ns, db).await?.iter() {
+								out.insert(v.path.to_url(), v.to_string().into());
 							}
 							out.into()
 						},
@@ -222,8 +232,7 @@ impl InfoStatement {
 				// Allowed to run?
 				opt.is_allowed(Action::View, ResourceKind::Any, &Base::Db)?;
 				// Get the NS and DB
-				let ns = opt.ns()?;
-				let db = opt.db()?;
+				let (ns, db) = opt.ns_db()?;
 				// Convert the version to u64 if present
 				let version = match version {
 					Some(v) => Some(v.compute(stk, ctx, opt, None).await?),
@@ -290,7 +299,10 @@ impl InfoStatement {
 				let res = match base {
 					Base::Root => txn.get_root_user(user).await?,
 					Base::Ns => txn.get_ns_user(opt.ns()?, user).await?,
-					Base::Db => txn.get_db_user(opt.ns()?, opt.db()?, user).await?,
+					Base::Db => {
+						let (ns, db) = opt.ns_db()?;
+						txn.get_db_user(ns, db, user).await?
+					}
 					_ => return Err(Error::InvalidLevel(base.to_string())),
 				};
 				// Ok all good
@@ -306,15 +318,15 @@ impl InfoStatement {
 				// Get the transaction
 				let txn = ctx.tx();
 				// Output
-				#[cfg(not(target_arch = "wasm32"))]
+				#[cfg(not(target_family = "wasm"))]
 				if let Some(ib) = ctx.get_index_builder() {
 					// Obtain the index
-					let res = txn.get_tb_index(opt.ns()?, opt.db()?, table, index).await?;
-					if let Some(status) = ib.get_status(&res).await {
-						let mut out = Object::default();
-						out.insert("building".to_string(), status.into());
-						return Ok(out.into());
-					}
+					let (ns, db) = opt.ns_db()?;
+					let res = txn.get_tb_index(ns, db, table, index).await?;
+					let status = ib.get_status(ns, db, &res).await;
+					let mut out = Object::default();
+					out.insert("building".to_string(), status.into());
+					return Ok(out.into());
 				}
 				Ok(Object::default().into())
 			}
@@ -390,4 +402,17 @@ where
 	T: InfoStructure + Clone,
 {
 	Value::Array(a.iter().cloned().map(InfoStructure::structure).collect())
+}
+
+async fn system() -> Value {
+	let info = INFORMATION.lock().await;
+	Value::from(map! {
+		"available_parallelism".to_string() => info.available_parallelism.into(),
+		"cpu_usage".to_string() => info.cpu_usage.into(),
+		"load_average".to_string() => info.load_average.to_vec().into(),
+		"memory_usage".to_string() => info.memory_usage.into(),
+		"physical_cores".to_string() => info.physical_cores.into(),
+		"memory_allocated".to_string() => info.memory_allocated.into(),
+		"threads".to_string() => info.threads.into(),
+	})
 }

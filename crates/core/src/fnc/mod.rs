@@ -8,6 +8,7 @@ use crate::sql::value::Value;
 use crate::sql::Thing;
 use reblessive::tree::Stk;
 
+pub mod api;
 pub mod args;
 pub mod array;
 pub mod bytes;
@@ -45,6 +46,7 @@ pub async fn run(
 	args: Vec<Value>,
 ) -> Result<Value, Error> {
 	if name.eq("sleep")
+		|| name.eq("api::invoke")
 		|| name.eq("array::all")
 		|| name.eq("array::any")
 		|| name.eq("array::every")
@@ -59,6 +61,7 @@ pub async fn run(
 		|| name.eq("array::reduce")
 		|| name.eq("array::some")
 		|| name.eq("record::exists")
+		|| name.eq("record::refs")
 		|| name.eq("type::field")
 		|| name.eq("type::fields")
 		|| name.eq("value::diff")
@@ -248,6 +251,7 @@ pub fn synchronous(
 		//
 		"object::entries" => object::entries,
 		"object::from_entries" => object::from_entries,
+		"object::is_empty" => object::is_empty,
 		"object::keys" => object::keys,
 		"object::len" => object::len,
 		"object::values" => object::values,
@@ -419,6 +423,7 @@ pub fn synchronous(
 		"type::is::object" => r#type::is::object,
 		"type::is::point" => r#type::is::point,
 		"type::is::polygon" => r#type::is::polygon,
+		"type::is::range" => r#type::is::range,
 		"type::is::record" => r#type::is::record,
 		"type::is::string" => r#type::is::string,
 		"type::is::uuid" => r#type::is::uuid,
@@ -459,14 +464,14 @@ pub async fn asynchronous(
 ) -> Result<Value, Error> {
 	// Wrappers return a function as opposed to a value so that the dispatch! method can always
 	// perform a function call.
-	#[cfg(not(target_arch = "wasm32"))]
+	#[cfg(not(target_family = "wasm"))]
 	fn cpu_intensive<R: Send + 'static>(
 		function: impl FnOnce() -> R + Send + 'static,
 	) -> impl FnOnce() -> async_executor::Task<R> {
 		|| crate::exe::spawn(async move { function() })
 	}
 
-	#[cfg(target_arch = "wasm32")]
+	#[cfg(target_family = "wasm")]
 	fn cpu_intensive<R: Send + 'static>(
 		function: impl FnOnce() -> R + Send + 'static,
 	) -> impl FnOnce() -> std::future::Ready<R> {
@@ -477,6 +482,8 @@ pub async fn asynchronous(
 		name,
 		args,
 		"no such builtin function found",
+		//
+		"api::invoke" => api::invoke((stk, ctx, opt)).await,
 		//
 		"array::all" => array::all((stk, ctx, Some(opt), doc)).await,
 		"array::any" => array::any((stk, ctx, Some(opt), doc)).await,
@@ -509,6 +516,7 @@ pub async fn asynchronous(
 		"http::delete" => http::delete(ctx).await,
 		//
 		"record::exists" => record::exists((stk, ctx, Some(opt), doc)).await,
+		"record::refs" => record::refs((stk, ctx, opt, doc)).await,
 		//
 		"search::analyze" => search::analyze((stk, ctx, Some(opt))).await,
 		"search::score" => search::score((ctx, doc)).await,
@@ -675,6 +683,7 @@ pub async fn idiom(
 				"id" => record::id,
 				"table" => record::tb,
 				"tb" => record::tb,
+				"refs" => record::refs((stk, ctx, opt, doc)).await,
 			)
 		}
 		Value::Object(_) => {
@@ -684,6 +693,7 @@ pub async fn idiom(
 				"no such method found for the object type",
 				//
 				"entries" => object::entries,
+				"is_empty" => object::is_empty,
 				"keys" => object::keys,
 				"len" => object::len,
 				"values" => object::values,
@@ -844,6 +854,7 @@ pub async fn idiom(
 				"is_object" => r#type::is::object,
 				"is_point" => r#type::is::point,
 				"is_polygon" => r#type::is::polygon,
+				"is_range" => r#type::is::range,
 				"is_record" => r#type::is::record,
 				"is_string" => r#type::is::string,
 				"is_uuid" => r#type::is::uuid,
@@ -895,9 +906,11 @@ fn get_execution_context<'a>(
 mod tests {
 	use regex::Regex;
 
-	#[cfg(all(feature = "scripting", feature = "kv-mem"))]
 	use crate::dbs::Capabilities;
-	use crate::sql::{statements::OutputStatement, Function, Query, Statement, Value};
+	use crate::{
+		dbs::capabilities::ExperimentalTarget,
+		sql::{statements::OutputStatement, Function, Query, Statement, Value},
+	};
 
 	#[tokio::test]
 	async fn implementations_are_present() {
@@ -922,7 +935,11 @@ mod tests {
 			let (quote, _) = line.split_once("=>").unwrap();
 			let name = quote.trim().trim_matches('"');
 
-			let res = crate::syn::parse(&format!("RETURN {}()", name));
+			let res = crate::syn::parse_with_capabilities(
+				&format!("RETURN {}()", name),
+				&Capabilities::all().with_experimental(ExperimentalTarget::DefineApi.into()),
+			);
+
 			if let Ok(Query(mut x)) = res {
 				match x.0.pop() {
 					Some(Statement::Output(OutputStatement {

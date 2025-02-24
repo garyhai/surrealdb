@@ -4,14 +4,14 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::sql::fmt::{fmt_separated_by, is_pretty, pretty_indent, Fmt, Pretty};
 use crate::sql::Value;
-use derive::Store;
+
 use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Write};
 
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub struct IfelseStatement {
@@ -29,7 +29,7 @@ impl IfelseStatement {
 				return true;
 			}
 		}
-		self.close.as_ref().map_or(false, |v| v.writeable())
+		self.close.as_ref().is_some_and(Value::writeable)
 	}
 	/// Check if we require a writeable transaction
 	pub(crate) fn bracketed(&self) -> bool {

@@ -4,9 +4,11 @@ use crate::ctx::Context;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::key::r#ref::Ref;
+use crate::kvs::KeyDecode as _;
 use crate::sql::{escape::escape_rid, id::Id, Strand, Value};
 use crate::syn;
-use derive::Store;
+use futures::StreamExt;
 use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ const ID: &str = "id";
 pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Thing";
 
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Thing")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
@@ -129,6 +131,61 @@ impl Thing {
 				Thing::from((self.tb, self.id)).into(),
 			))))),
 		}
+	}
+
+	pub(crate) async fn refs(
+		&self,
+		ctx: &Context,
+		opt: &Options,
+		ft: Option<&Table>,
+		ff: Option<&Idiom>,
+	) -> Result<Vec<Thing>, Error> {
+		let (ns, db) = opt.ns_db()?;
+
+		let (prefix, suffix) = match (ft, ff) {
+			(Some(ft), Some(ff)) => {
+				let ff = ff.to_string();
+
+				(
+					crate::key::r#ref::ffprefix(ns, db, &self.tb, &self.id, ft, &ff),
+					crate::key::r#ref::ffsuffix(ns, db, &self.tb, &self.id, ft, &ff),
+				)
+			}
+			(Some(ft), None) => (
+				crate::key::r#ref::ftprefix(ns, db, &self.tb, &self.id, ft),
+				crate::key::r#ref::ftsuffix(ns, db, &self.tb, &self.id, ft),
+			),
+			(None, None) => (
+				crate::key::r#ref::prefix(ns, db, &self.tb, &self.id),
+				crate::key::r#ref::suffix(ns, db, &self.tb, &self.id),
+			),
+			(None, Some(_)) => {
+				return Err(Error::Unreachable(
+					"A foreign field was passed without a foreign table".into(),
+				))
+			}
+		};
+
+		let range = prefix?..suffix?;
+		let txn = ctx.tx();
+		let mut stream = txn.stream_keys(range, None);
+
+		// Collect the keys from the stream into a vec
+		let mut keys: Vec<Vec<u8>> = vec![];
+		while let Some(res) = stream.next().await {
+			keys.push(res?);
+		}
+
+		let mut ids = Vec::new();
+		for x in keys.iter() {
+			let key = Ref::decode(x)?;
+			ids.push(Thing {
+				tb: key.ft.to_string(),
+				id: key.fk,
+			})
+		}
+
+		Ok(ids)
 	}
 }
 

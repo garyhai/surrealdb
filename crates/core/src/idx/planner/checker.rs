@@ -130,7 +130,7 @@ pub struct MTreeChecker<'a> {
 	ctx: &'a Context,
 }
 
-impl<'a> MTreeChecker<'a> {
+impl MTreeChecker<'_> {
 	async fn convert_result(
 		&self,
 		doc_ids: &DocIds,
@@ -143,7 +143,7 @@ impl<'a> MTreeChecker<'a> {
 		let txn = self.ctx.tx();
 		for (doc_id, dist) in res {
 			if let Some(key) = doc_ids.get_doc_key(&txn, doc_id).await? {
-				let rid: Thing = key.into();
+				let rid: Thing = revision::from_slice(&key)?;
 				result.push_back((rid.into(), dist, None));
 			}
 		}
@@ -215,7 +215,7 @@ pub struct MTreeCondChecker<'a> {
 	cache: HashMap<DocId, CheckerCacheEntry>,
 }
 
-impl<'a> MTreeCondChecker<'a> {
+impl MTreeCondChecker<'_> {
 	async fn check_truthy(
 		&mut self,
 		stk: &mut Stk,
@@ -226,7 +226,11 @@ impl<'a> MTreeCondChecker<'a> {
 			Entry::Occupied(e) => Ok(e.get().truthy),
 			Entry::Vacant(e) => {
 				let txn = self.ctx.tx();
-				let rid = doc_ids.get_doc_key(&txn, doc_id).await?.map(|k| k.into());
+				let rid = doc_ids
+					.get_doc_key(&txn, doc_id)
+					.await?
+					.map(|k| revision::from_slice(&k))
+					.transpose()?;
 				let ent =
 					CheckerCacheEntry::build(stk, self.ctx, self.opt, rid, self.cond.as_ref())
 						.await?;
@@ -281,7 +285,7 @@ pub struct HnswCondChecker<'a> {
 	cache: HashMap<DocId, CheckerCacheEntry>,
 }
 
-impl<'a> HnswCondChecker<'a> {
+impl HnswCondChecker<'_> {
 	fn convert_result(&mut self, res: VecDeque<(DocId, f64)>) -> VecDeque<KnnIteratorResult> {
 		CheckerCacheEntry::convert_result(res, &mut self.cache)
 	}

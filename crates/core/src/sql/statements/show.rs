@@ -4,8 +4,8 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::iam::{Action, ResourceKind};
 use crate::sql::{Base, Datetime, Table, Value};
-use crate::vs::{conv, Versionstamp};
-use derive::Store;
+use crate::vs::VersionStamp;
+
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -20,21 +20,21 @@ pub enum ShowSince {
 }
 
 impl ShowSince {
-	pub fn versionstamp(vs: &Versionstamp) -> ShowSince {
-		ShowSince::Versionstamp(conv::versionstamp_to_u64(vs))
+	pub fn versionstamp(vs: &VersionStamp) -> ShowSince {
+		ShowSince::Versionstamp(vs.into_u64_lossy())
 	}
 
-	pub fn as_versionstamp(&self) -> Option<Versionstamp> {
+	pub fn as_versionstamp(&self) -> Option<VersionStamp> {
 		match self {
 			ShowSince::Timestamp(_) => None,
-			ShowSince::Versionstamp(v) => Some(conv::u64_to_versionstamp(*v)),
+			ShowSince::Versionstamp(v) => Some(VersionStamp::from_u64(*v)),
 		}
 	}
 }
 
 /// A SHOW CHANGES statement for displaying changes made to a table or database.
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub struct ShowStatement {
@@ -56,10 +56,11 @@ impl ShowStatement {
 		// Get the transaction
 		let txn = ctx.tx();
 		// Process the show query
+		let (ns, db) = opt.ns_db()?;
 		let r = crate::cf::read(
 			&txn,
-			opt.ns()?,
-			opt.db()?,
+			ns,
+			db,
 			self.table.as_deref().map(String::as_str),
 			self.since.clone(),
 			self.limit,

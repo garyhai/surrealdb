@@ -34,8 +34,6 @@ pub(crate) enum Statement<'a> {
 	Relate(&'a RelateStatement),
 	Delete(&'a DeleteStatement),
 	Insert(&'a InsertStatement),
-	// TODO(gguillemas): Document once bearer access is no longer experimental.
-	#[doc(hidden)]
 	Access(&'a AccessStatement),
 }
 
@@ -367,20 +365,6 @@ impl Statement<'_> {
 			Statement::Delete(v) => v.output.as_ref(),
 			Statement::Insert(v) => v.output.as_ref(),
 			_ => None,
-		}
-	}
-
-	/// Returns any PARALLEL clause if specified
-	pub(crate) fn parallel(&self) -> bool {
-		match self {
-			Statement::Select(v) => v.parallel,
-			Statement::Create(v) => v.parallel,
-			Statement::Upsert(v) => v.parallel,
-			Statement::Update(v) => v.parallel,
-			Statement::Relate(v) => v.parallel,
-			Statement::Delete(v) => v.parallel,
-			Statement::Insert(v) => v.parallel,
-			_ => false,
 		}
 	}
 

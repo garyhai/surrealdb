@@ -20,7 +20,7 @@ use super::Kind;
 
 pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Function";
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Function")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -29,8 +29,24 @@ pub enum Function {
 	Normal(String, Vec<Value>),
 	Custom(String, Vec<Value>),
 	Script(Script, Vec<Value>),
+	#[revision(
+		end = 2,
+		convert_fn = "convert_anonymous_arg_computation",
+		fields_name = "OldAnonymousFields"
+	)]
 	Anonymous(Value, Vec<Value>),
+	#[revision(start = 2)]
+	Anonymous(Value, Vec<Value>, bool),
 	// Add new variants here
+}
+
+impl Function {
+	fn convert_anonymous_arg_computation(
+		old: OldAnonymousFields,
+		_revision: u16,
+	) -> Result<Self, revision::Error> {
+		Ok(Function::Anonymous(old.0, old.1, false))
+	}
 }
 
 pub(crate) enum OptimisedAggregate {
@@ -72,10 +88,19 @@ impl Function {
 	/// Convert function call to a field name
 	pub fn to_idiom(&self) -> Idiom {
 		match self {
-			Self::Anonymous(_, _) => "function".to_string().into(),
+			Self::Anonymous(_, _, _) => "function".to_string().into(),
 			Self::Script(_, _) => "function".to_string().into(),
 			Self::Normal(f, _) => f.to_owned().into(),
 			Self::Custom(f, _) => format!("fn::{f}").into(),
+		}
+	}
+	/// Checks if this function invocation is writable
+	pub fn writeable(&self) -> bool {
+		match self {
+			Self::Custom(_, _) => true,
+			Self::Script(_, _) => true,
+			Self::Normal(f, _) if f == "api::invoke" => true,
+			_ => self.args().iter().any(Value::writeable),
 		}
 	}
 	/// Convert this function to an aggregate
@@ -115,7 +140,7 @@ impl Function {
 
 	/// Check if this function is a closure function
 	pub fn is_inline(&self) -> bool {
-		matches!(self, Self::Anonymous(_, _))
+		matches!(self, Self::Anonymous(_, _, _))
 	}
 
 	/// Check if this function is a rolling function
@@ -215,7 +240,7 @@ impl Function {
 				// Run the normal function
 				fnc::run(stk, ctx, opt, doc, s, a).await
 			}
-			Self::Anonymous(v, x) => {
+			Self::Anonymous(v, x, args_computed) => {
 				let val = match v {
 					c @ Value::Closure(_) => c.clone(),
 					Value::Param(p) => ctx.value(p).cloned().unwrap_or(Value::None),
@@ -228,14 +253,19 @@ impl Function {
 				match val {
 					Value::Closure(closure) => {
 						// Compute the function arguments
-						let a = stk
-							.scope(|scope| {
-								try_join_all(
-									x.iter()
-										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
-								)
-							})
-							.await?;
+						let a =
+							match args_computed {
+								true => x.clone(),
+								false => {
+									stk.scope(|scope| {
+										try_join_all(x.iter().map(|v| {
+											scope.run(|stk| v.compute(stk, ctx, opt, doc))
+										}))
+									})
+									.await?
+								}
+							};
+
 						stk.run(|stk| closure.compute(stk, ctx, opt, doc, a)).await
 					}
 					v => Err(Error::InvalidFunction {
@@ -250,7 +280,8 @@ impl Function {
 				// Check this function is allowed
 				ctx.check_allowed_function(name.as_str())?;
 				// Get the function definition
-				let val = ctx.tx().get_db_function(opt.ns()?, opt.db()?, s).await?;
+				let (ns, db) = opt.ns_db()?;
+				let val = ctx.tx().get_db_function(ns, db, s).await?;
 				// Check permissions
 				if opt.check_perms(Action::View)? {
 					match &val.permissions {
@@ -366,7 +397,7 @@ impl fmt::Display for Function {
 			Self::Normal(s, e) => write!(f, "{s}({})", Fmt::comma_separated(e)),
 			Self::Custom(s, e) => write!(f, "fn::{s}({})", Fmt::comma_separated(e)),
 			Self::Script(s, e) => write!(f, "function({}) {{{s}}}", Fmt::comma_separated(e)),
-			Self::Anonymous(p, e) => write!(f, "{p}({})", Fmt::comma_separated(e)),
+			Self::Anonymous(p, e, _) => write!(f, "{p}({})", Fmt::comma_separated(e)),
 		}
 	}
 }

@@ -13,11 +13,11 @@ use crate::sql::field::{Field, Fields};
 use crate::sql::id::Id;
 use crate::sql::part::{FindRecursionPlan, Next, NextMethod, SplitByRepeatRecurse};
 use crate::sql::part::{Part, Skip};
-use crate::sql::paths::ID;
 use crate::sql::statements::select::SelectStatement;
 use crate::sql::thing::Thing;
 use crate::sql::value::{Value, Values};
 use crate::sql::Function;
+use futures::future::try_join_all;
 use reblessive::tree::Stk;
 
 use super::idiom_recursion::{compute_idiom_recursion, Recursion};
@@ -40,7 +40,7 @@ impl Value {
 		}
 		match path.first() {
 			// The knowledge of the current value is not relevant to Part::Recurse
-			Some(Part::Recurse(recurse, inner_path)) => {
+			Some(Part::Recurse(recurse, inner_path, instruction)) => {
 				// Find the path to recurse and what path to process after the recursion is finished
 				let (path, after) = match inner_path {
 					Some(p) => (p.0.as_slice(), path.next().to_vec()),
@@ -56,12 +56,23 @@ impl Value {
 					// If we do not find a root-level repeat-recurse symbol, we
 					// can scan for a nested one. We only ever allow for a single
 					// repeat recurse symbol, hence the separate check.
-					_ => match path.find_recursion_plan() {
-						Some((path, plan, local_after)) => {
-							(path, Some(plan), [local_after, &after].concat())
+					_ => {
+						// If the user already specified a recursion instruction,
+						// we will not process any recursion plans.
+						if instruction.is_some() {
+							match path.find_recursion_plan() {
+								Some(_) => return Err(Error::RecursionInstructionPlanConflict),
+								_ => (path, None, after),
+							}
+						} else {
+							match path.find_recursion_plan() {
+								Some((path, plan, local_after)) => {
+									(path, Some(plan), [local_after, &after].concat())
+								}
+								_ => (path, None, after),
+							}
 						}
-						_ => (path, None, after),
-					},
+					}
 				};
 
 				// Collect the min & max for the recursion context
@@ -74,6 +85,7 @@ impl Value {
 					current: self,
 					path,
 					plan: plan.as_ref(),
+					instruction: instruction.as_ref(),
 				};
 
 				// Compute the recursion
@@ -105,6 +117,11 @@ impl Value {
 			}
 			// Get the current value at the path
 			Some(p) => match self {
+				// Compute the refs first, then continue the path
+				Value::Refs(r) => {
+					let v = r.compute(ctx, opt, doc).await?;
+					stk.run(|stk| v.get(stk, ctx, opt, doc, path)).await
+				}
 				// Current value at path is a geometry
 				Value::Geometry(v) => match p {
 					// If this is the 'type' field then continue
@@ -127,10 +144,16 @@ impl Value {
 						stk.run(|stk| obj.get(stk, ctx, opt, doc, path)).await
 					}
 					Part::Method(name, args) => {
-						let v = stk
-							.run(|stk| {
-								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
 							})
+							.await?;
+						let v = stk
+							.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 							.await?;
 						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 					}
@@ -231,6 +254,14 @@ impl Value {
 						stk.run(|stk| obj.get(stk, ctx, opt, doc, path.next())).await
 					}
 					Part::Method(name, args) => {
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
+							})
+							.await?;
 						let res = stk
 							.run(|stk| {
 								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
@@ -242,7 +273,7 @@ impl Value {
 								..
 							}) => match v.get(name) {
 								Some(v) => {
-									let fnc = Function::Anonymous(v.clone(), args.clone());
+									let fnc = Function::Anonymous(v.clone(), a, true);
 									match stk.run(|stk| fnc.compute(stk, ctx, opt, doc)).await {
 										Ok(v) => Ok(v),
 										Err(Error::InvalidFunction {
@@ -332,10 +363,16 @@ impl Value {
 						_ => stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await,
 					},
 					Part::Method(name, args) => {
-						let v = stk
-							.run(|stk| {
-								idiom(stk, ctx, opt, doc, v.clone().into(), name, args.clone())
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
 							})
+							.await?;
+						let v = stk
+							.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 							.await?;
 						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 					}
@@ -402,61 +439,64 @@ impl Value {
 						_ => match p {
 							// This is a graph traversal expression
 							Part::Graph(g) => {
+								let last_part = path.len() == 1;
+								let expr = g.expr.clone().unwrap_or(if last_part {
+									Fields::value_id()
+								} else {
+									Fields::all()
+								});
+
 								let stm = SelectStatement {
-									expr: Fields(vec![Field::All], false),
+									expr,
 									what: Values(vec![Value::from(Edges {
 										from: val,
 										dir: g.dir.clone(),
 										what: g.what.clone(),
 									})]),
 									cond: g.cond.clone(),
+									limit: g.limit.clone(),
+									order: g.order.clone(),
+									split: g.split.clone(),
+									group: g.group.clone(),
+									start: g.start.clone(),
 									..SelectStatement::default()
 								};
-								match path.len() {
-									1 => {
-										let v = stk
-											.run(|stk| stm.compute(stk, ctx, opt, None))
-											.await?
-											.all();
-										stk.run(|stk| v.get(stk, ctx, opt, None, ID.as_ref()))
-											.await?
-											.flatten()
-											.ok()
-									}
-									_ => {
-										let v = stk
-											.run(|stk| stm.compute(stk, ctx, opt, None))
-											.await?
-											.all();
-										let res = stk
-											.run(|stk| v.get(stk, ctx, opt, None, path.next()))
-											.await?;
-										// We only want to flatten the results if the next part
-										// is a graph or where part. Reason being that if we flatten
-										// fields, the results of those fields (which could be arrays)
-										// will be merged into each other. So [1, 2, 3], [4, 5, 6] would
-										// become [1, 2, 3, 4, 5, 6]. This slice access won't panic
-										// as we have already checked the length of the path.
-										Ok(match path[1] {
-											Part::Graph(_) | Part::Where(_) => res.flatten(),
-											_ => res,
-										})
-									}
+
+								if last_part {
+									stk.run(|stk| stm.compute(stk, ctx, opt, None))
+										.await?
+										.all()
+										.ok()
+								} else {
+									let v = stk
+										.run(|stk| stm.compute(stk, ctx, opt, None))
+										.await?
+										.all();
+									let res = stk
+										.run(|stk| v.get(stk, ctx, opt, None, path.next()))
+										.await?;
+									// We only want to flatten the results if the next part
+									// is a graph or where part. Reason being that if we flatten
+									// fields, the results of those fields (which could be arrays)
+									// will be merged into each other. So [1, 2, 3], [4, 5, 6] would
+									// become [1, 2, 3, 4, 5, 6]. This slice access won't panic
+									// as we have already checked the length of the path.
+									Ok(match path[1] {
+										Part::Graph(_) | Part::Where(_) => res.flatten(),
+										_ => res,
+									})
 								}
 							}
 							Part::Method(name, args) => {
-								let v = stk
-									.run(|stk| {
-										idiom(
-											stk,
-											ctx,
-											opt,
-											doc,
-											v.clone().into(),
-											name,
-											args.clone(),
-										)
+								let a = stk
+									.scope(|scope| {
+										try_join_all(args.iter().map(|v| {
+											scope.run(|stk| v.compute(stk, ctx, opt, doc))
+										}))
 									})
+									.await?;
+								let v = stk
+									.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
 									.await?;
 								stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 							}
@@ -499,8 +539,17 @@ impl Value {
 							stk.run(|stk| v.get(stk, ctx, opt, None, path.next())).await
 						}
 						Part::Method(name, args) => {
+							let a = stk
+								.scope(|scope| {
+									try_join_all(
+										args.iter().map(|v| {
+											scope.run(|stk| v.compute(stk, ctx, opt, doc))
+										}),
+									)
+								})
+								.await?;
 							let v = stk
-								.run(|stk| idiom(stk, ctx, opt, doc, v.clone(), name, args.clone()))
+								.run(|stk| idiom(stk, ctx, opt, doc, v.clone(), name, a))
 								.await?;
 							stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
 						}

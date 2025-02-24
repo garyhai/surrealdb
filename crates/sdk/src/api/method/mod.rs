@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use surrealdb_core::sql::to_value as to_core_value;
+use surrealdb_core::sql::Value as CoreValue;
 
 pub(crate) mod live;
 pub(crate) mod query;
@@ -55,13 +56,17 @@ mod version;
 mod tests;
 
 pub use authenticate::Authenticate;
-#[doc(hidden)] // Not supported yet
+/// Not supported yet
+#[doc(hidden)]
 pub use begin::Begin;
-#[doc(hidden)] // Not supported yet
+/// Not supported yet
+#[doc(hidden)]
 pub use begin::Transaction;
-#[doc(hidden)] // Not supported yet
+/// Not supported yet
+#[doc(hidden)]
 pub use cancel::Cancel;
-#[doc(hidden)] // Not supported yet
+/// Not supported yet
+#[doc(hidden)]
 pub use commit::Commit;
 pub use content::Content;
 pub use create::Create;
@@ -253,8 +258,11 @@ where
 		}
 	}
 
-	#[doc(hidden)] // Not supported yet
+	/// Not supported yet
+	#[doc(hidden)]
+	#[cfg(surrealdb_unstable)] // Mark this API as unstable
 	pub fn transaction(self) -> Begin<C> {
+		warn!("Client side transactions are not yet supported. This API doesn't do anything yet.");
 		Begin {
 			client: self,
 		}
@@ -642,15 +650,24 @@ where
 	/// # }
 	/// ```
 	pub fn query(&self, query: impl opt::IntoQuery) -> Query<C> {
-		let inner = query.into_query().map(|x| ValidQuery {
-			client: Cow::Borrowed(self),
-			query: x,
-			bindings: Default::default(),
-			register_live_queries: true,
-		});
+		let inner = match query.into_query() {
+			Ok(query) => Ok(ValidQuery::Normal {
+				query,
+				register_live_queries: true,
+				bindings: Default::default(),
+			}),
+			Err(crate::Error::Api(crate::api::err::Error::RawQuery(query))) => {
+				Ok(ValidQuery::Raw {
+					query,
+					bindings: Default::default(),
+				})
+			}
+			Err(error) => Err(error),
+		};
 
 		Query {
 			inner,
+			client: Cow::Borrowed(self),
 		}
 	}
 
@@ -1404,5 +1421,13 @@ where
 			is_ml: false,
 			import_type: PhantomData,
 		}
+	}
+}
+
+fn validate_data(data: &CoreValue, error_message: &str) -> crate::Result<()> {
+	match data {
+		CoreValue::Object(_) => Ok(()),
+		CoreValue::Array(v) if v.iter().all(CoreValue::is_object) => Ok(()),
+		_ => Err(crate::api::err::Error::InvalidParams(error_message.to_owned()).into()),
 	}
 }

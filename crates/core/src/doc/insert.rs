@@ -7,7 +7,7 @@ use crate::sql::value::Value;
 use reblessive::tree::Stk;
 
 impl Document {
-	pub async fn insert(
+	pub(super) async fn insert(
 		&mut self,
 		stk: &mut Stk,
 		ctx: &Context,
@@ -38,19 +38,29 @@ impl Document {
 					true => match self.is_specific_record_id() {
 						// No specific Record ID has been specified, so retry
 						false => Err(Error::RetryWithId(thing)),
-						// A specific Record ID was specified, so error
-						true => Err(Error::IndexExists {
+						// A specific Record ID was specified
+						true => match stm.is_ignore() {
+							// There is no IGNORE keyword specified
+							false => Err(Error::IndexExists {
+								thing,
+								index,
+								value,
+							}),
+							// There is an IGNORE keyword specified
+							true => Err(Error::Ignore),
+						},
+					},
+					// There is no ON DUPLICATE KEY UPDATE clause
+					false => match stm.is_ignore() {
+						// There is no IGNORE keyword specified
+						false => Err(Error::IndexExists {
 							thing,
 							index,
 							value,
 						}),
+						// There is an IGNORE keyword specified
+						true => Err(Error::Ignore),
 					},
-					// There is no ON DUPLICATE KEY UPDATE clause
-					false => Err(Error::IndexExists {
-						thing,
-						index,
-						value,
-					}),
 				},
 				// We attempted to INSERT a document with an ID,
 				// and this ID already exists in the database,
@@ -63,9 +73,11 @@ impl Document {
 					true => Err(Error::RetryWithId(thing)),
 					// There is no ON DUPLICATE KEY UPDATE clause
 					false => match stm.is_ignore() {
+						// There is no IGNORE keyword specified
 						false => Err(Error::RecordExists {
 							thing,
 						}),
+						// There is an IGNORE keyword specified
 						true => Err(Error::Ignore),
 					},
 				},
@@ -97,7 +109,7 @@ impl Document {
 		self.process_merge_data(stk, ctx, opt, stm).await?;
 		self.store_edges_data(ctx, opt, stm).await?;
 		self.process_table_fields(stk, ctx, opt, stm).await?;
-		self.cleanup_table_fields(stk, ctx, opt, stm).await?;
+		self.cleanup_table_fields(ctx, opt, stm).await?;
 		self.default_record_data(ctx, opt, stm).await?;
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.store_record_data(ctx, opt, stm).await?;
@@ -123,7 +135,7 @@ impl Document {
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.process_record_data(stk, ctx, opt, stm).await?;
 		self.process_table_fields(stk, ctx, opt, stm).await?;
-		self.cleanup_table_fields(stk, ctx, opt, stm).await?;
+		self.cleanup_table_fields(ctx, opt, stm).await?;
 		self.default_record_data(ctx, opt, stm).await?;
 		self.check_permissions_table(stk, ctx, opt, stm).await?;
 		self.store_record_data(ctx, opt, stm).await?;

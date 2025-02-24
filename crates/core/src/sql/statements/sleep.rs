@@ -4,13 +4,13 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::iam::{Action, ResourceKind};
 use crate::sql::{Base, Duration, Value};
-use derive::Store;
+
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
 pub struct SleepStatement {
 	pub(crate) duration: Duration,
@@ -32,9 +32,9 @@ impl SleepStatement {
 			(_, d) => d,
 		};
 		// Sleep for the specified time
-		#[cfg(target_arch = "wasm32")]
+		#[cfg(target_family = "wasm")]
 		wasmtimer::tokio::sleep(dur).await;
-		#[cfg(not(target_arch = "wasm32"))]
+		#[cfg(not(target_family = "wasm"))]
 		tokio::time::sleep(dur).await;
 		// Ok all good
 		Ok(Value::None)

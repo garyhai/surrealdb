@@ -5,8 +5,7 @@ use crate::sql::statements::DefineTableStatement;
 use crate::sql::thing::Thing;
 use crate::sql::value::Value;
 use crate::sql::Operation;
-use crate::vs::to_u128_be;
-use derive::Store;
+use crate::vs::VersionStamp;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -14,7 +13,7 @@ use std::fmt::{self, Display, Formatter};
 
 // Mutation is a single mutation to a table.
 #[revisioned(revision = 2)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
 pub enum TableMutation {
 	// Although the Value is supposed to contain a field "id" of Thing,
@@ -46,7 +45,7 @@ impl From<DefineTableStatement> for Value {
 }
 
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
 pub struct TableMutations(pub String, pub Vec<TableMutation>);
 
@@ -57,7 +56,7 @@ impl TableMutations {
 }
 
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
 pub struct DatabaseMutation(pub Vec<TableMutations>);
 
@@ -75,9 +74,9 @@ impl Default for DatabaseMutation {
 
 // Change is a set of mutations made to a table at the specific timestamp.
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
-pub struct ChangeSet(pub [u8; 10], pub DatabaseMutation);
+pub struct ChangeSet(pub VersionStamp, pub DatabaseMutation);
 
 impl TableMutation {
 	/// Convert a stored change feed table mutation (record change) into a
@@ -150,8 +149,7 @@ impl DatabaseMutation {
 impl ChangeSet {
 	pub fn into_value(self) -> Value {
 		let mut m = BTreeMap::<String, Value>::new();
-		let vs = to_u128_be(self.0);
-		m.insert("versionstamp".to_string(), Value::from(vs));
+		m.insert("versionstamp".to_string(), Value::from(self.0.into_u128()));
 		m.insert("changes".to_string(), self.1.into_value());
 		let so: Object = m.into();
 		Value::Object(so)
@@ -197,7 +195,7 @@ impl Display for ChangeSet {
 
 // WriteMutationSet is a set of mutations to be to a table at the specific timestamp.
 #[revisioned(revision = 1)]
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
 pub struct WriteMutationSet(pub Vec<TableMutations>);
 
@@ -220,7 +218,7 @@ mod tests {
 		use super::*;
 		use std::collections::HashMap;
 		let cs = ChangeSet(
-			[0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+			VersionStamp::from_u64(1),
 			DatabaseMutation(vec![TableMutations(
 				"mytb".to_string(),
 				vec![
@@ -255,7 +253,7 @@ mod tests {
 		use super::*;
 		use std::collections::HashMap;
 		let cs = ChangeSet(
-			[0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+			VersionStamp::from_u64(1),
 			DatabaseMutation(vec![TableMutations(
 				"mytb".to_string(),
 				vec![

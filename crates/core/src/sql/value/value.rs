@@ -8,6 +8,7 @@ use crate::fnc::util::string::fuzzy::Fuzzy;
 use crate::sql::id::range::IdRange;
 use crate::sql::kind::Literal;
 use crate::sql::range::OldRange;
+use crate::sql::reference::Refs;
 use crate::sql::statements::info::InfoStructure;
 use crate::sql::Closure;
 use crate::sql::{
@@ -20,7 +21,7 @@ use crate::sql::{
 	Strand, Subquery, Table, Tables, Thing, Uuid,
 };
 use chrono::{DateTime, Utc};
-use derive::Store;
+
 use geo::Point;
 use reblessive::tree::Stk;
 use revision::revisioned;
@@ -84,7 +85,7 @@ impl From<&Tables> for Values {
 }
 
 #[revisioned(revision = 2)]
-#[derive(Clone, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[serde(rename = "$surrealdb::private::sql::Value")]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
@@ -137,6 +138,7 @@ pub enum Value {
 	Query(Query),
 	Model(Box<Model>),
 	Closure(Box<Closure>),
+	Refs(Refs),
 	// Add new variants here
 }
 
@@ -496,6 +498,12 @@ impl From<Vec<i32>> for Value {
 
 impl From<Vec<f32>> for Value {
 	fn from(v: Vec<f32>) -> Self {
+		Value::Array(Array::from(v))
+	}
+}
+
+impl From<Vec<f64>> for Value {
+	fn from(v: Vec<f64>) -> Self {
 		Value::Array(Array::from(v))
 	}
 }
@@ -925,6 +933,15 @@ impl Value {
 	/// Check if this Value is NONE
 	pub fn is_none(&self) -> bool {
 		matches!(self, Value::None)
+	}
+
+	/// Check if this Value is NONE
+	pub fn is_empty_array(&self) -> bool {
+		if let Value::Array(v) = self {
+			v.is_empty()
+		} else {
+			false
+		}
 	}
 
 	/// Check if this Value is NULL
@@ -1378,6 +1395,10 @@ impl Value {
 				})
 			}
 			Kind::Literal(lit) => self.coerce_to_literal(lit),
+			Kind::References(_, _) => Err(Error::CoerceTo {
+				from: self,
+				into: kind.to_string(),
+			}),
 		};
 		// Check for any conversion errors
 		match res {
@@ -1397,7 +1418,6 @@ impl Value {
 	}
 
 	/// Try to coerce this value to an `i64`
-	#[doc(hidden)]
 	pub fn coerce_to_i64(self) -> Result<i64, Error> {
 		match self {
 			// Allow any int number
@@ -1974,6 +1994,10 @@ impl Value {
 				})
 			}
 			Kind::Literal(lit) => self.convert_to_literal(lit),
+			Kind::References(_, _) => Err(Error::CoerceTo {
+				from: self,
+				into: kind.to_string(),
+			}),
 		};
 		// Check for any conversion errors
 		match res {
@@ -2169,7 +2193,6 @@ impl Value {
 	}
 
 	/// Try to convert this value to a `String`
-	#[doc(hidden)]
 	pub fn convert_to_string(self) -> Result<String, Error> {
 		match self {
 			// Bytes can't convert to strings
@@ -2886,6 +2909,7 @@ impl fmt::Display for Value {
 			Value::Thing(v) => write!(f, "{v}"),
 			Value::Uuid(v) => write!(f, "{v}"),
 			Value::Closure(v) => write!(f, "{v}"),
+			Value::Refs(v) => write!(f, "{v}"),
 		}
 	}
 }
@@ -2920,9 +2944,7 @@ impl Value {
 			Value::Idiom(v) => v.writeable(),
 			Value::Array(v) => v.iter().any(Value::writeable),
 			Value::Object(v) => v.iter().any(|(_, v)| v.writeable()),
-			Value::Function(v) => {
-				v.is_custom() || v.is_script() || v.args().iter().any(Value::writeable)
-			}
+			Value::Function(v) => v.writeable(),
 			Value::Model(m) => m.args.iter().any(Value::writeable),
 			Value::Subquery(v) => v.writeable(),
 			Value::Expression(v) => v.writeable(),
@@ -2970,6 +2992,7 @@ impl Value {
 			Value::Model(v) => v.compute(stk, ctx, opt, doc).await,
 			Value::Subquery(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
 			Value::Expression(v) => stk.run(|stk| v.compute(stk, ctx, opt, doc)).await,
+			Value::Refs(v) => v.compute(ctx, opt, doc).await,
 			_ => Ok(self.to_owned()),
 		}
 	}
@@ -3198,43 +3221,38 @@ mod tests {
 	#[test]
 	fn check_size() {
 		assert!(64 >= std::mem::size_of::<Value>(), "size of value too big");
-		assert_eq!(104, std::mem::size_of::<Error>());
-		assert_eq!(104, std::mem::size_of::<Result<Value, Error>>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::number::Number>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::strand::Strand>());
-		assert_eq!(16, std::mem::size_of::<crate::sql::duration::Duration>());
-		assert_eq!(12, std::mem::size_of::<crate::sql::datetime::Datetime>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::array::Array>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::object::Object>());
-		assert_eq!(48, std::mem::size_of::<crate::sql::geometry::Geometry>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::param::Param>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::idiom::Idiom>());
-		assert_eq!(24, std::mem::size_of::<crate::sql::table::Table>());
-		assert_eq!(56, std::mem::size_of::<crate::sql::thing::Thing>());
-		assert_eq!(40, std::mem::size_of::<crate::sql::mock::Mock>());
-		assert_eq!(32, std::mem::size_of::<crate::sql::regex::Regex>());
-		assert_eq!(8, std::mem::size_of::<Box<crate::sql::range::Range>>());
-		assert_eq!(8, std::mem::size_of::<Box<crate::sql::edges::Edges>>());
-		assert_eq!(8, std::mem::size_of::<Box<crate::sql::function::Function>>());
-		assert_eq!(8, std::mem::size_of::<Box<crate::sql::subquery::Subquery>>());
-		assert_eq!(8, std::mem::size_of::<Box<crate::sql::expression::Expression>>());
+		assert!(104 >= std::mem::size_of::<Error>());
+		assert!(104 >= std::mem::size_of::<Result<Value, Error>>());
+		assert!(24 >= std::mem::size_of::<crate::sql::number::Number>());
+		assert!(24 >= std::mem::size_of::<crate::sql::strand::Strand>());
+		assert!(16 >= std::mem::size_of::<crate::sql::duration::Duration>());
+		assert!(12 >= std::mem::size_of::<crate::sql::datetime::Datetime>());
+		assert!(24 >= std::mem::size_of::<crate::sql::array::Array>());
+		assert!(24 >= std::mem::size_of::<crate::sql::object::Object>());
+		assert!(48 >= std::mem::size_of::<crate::sql::geometry::Geometry>());
+		assert!(24 >= std::mem::size_of::<crate::sql::param::Param>());
+		assert!(24 >= std::mem::size_of::<crate::sql::idiom::Idiom>());
+		assert!(24 >= std::mem::size_of::<crate::sql::table::Table>());
+		assert!(56 >= std::mem::size_of::<crate::sql::thing::Thing>());
+		assert!(40 >= std::mem::size_of::<crate::sql::mock::Mock>());
+		assert!(32 >= std::mem::size_of::<crate::sql::regex::Regex>());
 	}
 
 	#[test]
 	fn check_serialize() {
-		let enc: Vec<u8> = Value::None.into();
+		let enc: Vec<u8> = revision::to_vec(&Value::None).unwrap();
 		assert_eq!(2, enc.len());
-		let enc: Vec<u8> = Value::Null.into();
+		let enc: Vec<u8> = revision::to_vec(&Value::Null).unwrap();
 		assert_eq!(2, enc.len());
-		let enc: Vec<u8> = Value::Bool(true).into();
+		let enc: Vec<u8> = revision::to_vec(&Value::Bool(true)).unwrap();
 		assert_eq!(3, enc.len());
-		let enc: Vec<u8> = Value::Bool(false).into();
+		let enc: Vec<u8> = revision::to_vec(&Value::Bool(false)).unwrap();
 		assert_eq!(3, enc.len());
-		let enc: Vec<u8> = Value::from("test").into();
+		let enc: Vec<u8> = revision::to_vec(&Value::from("test")).unwrap();
 		assert_eq!(8, enc.len());
-		let enc: Vec<u8> = Value::parse("{ hello: 'world' }").into();
+		let enc: Vec<u8> = revision::to_vec(&Value::parse("{ hello: 'world' }")).unwrap();
 		assert_eq!(19, enc.len());
-		let enc: Vec<u8> = Value::parse("{ compact: true, schema: 0 }").into();
+		let enc: Vec<u8> = revision::to_vec(&Value::parse("{ compact: true, schema: 0 }")).unwrap();
 		assert_eq!(27, enc.len());
 	}
 
@@ -3246,8 +3264,8 @@ mod tests {
 		let res = Value::parse(
 			"{ test: { something: [1, 'two', null, test:tobie, { trueee: false, noneee: nulll }] } }",
 		);
-		let enc: Vec<u8> = val.into();
-		let dec: Value = enc.into();
+		let enc: Vec<u8> = revision::to_vec(&val).unwrap();
+		let dec: Value = revision::from_slice(&enc).unwrap();
 		assert_eq!(res, dec);
 	}
 

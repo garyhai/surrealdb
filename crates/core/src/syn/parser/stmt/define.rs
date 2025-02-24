@@ -1,12 +1,16 @@
 use reblessive::Stk;
 
-use crate::cnf::EXPERIMENTAL_BEARER_ACCESS;
+use crate::api::method::Method;
+use crate::api::middleware::RequestMiddleware;
 use crate::sql::access_type::JwtAccessVerify;
 use crate::sql::index::HnswParams;
+use crate::sql::statements::define::config::api::ApiConfig;
 use crate::sql::statements::define::config::graphql::{GraphQLConfig, TableConfig};
 use crate::sql::statements::define::config::ConfigInner;
-use crate::sql::statements::define::DefineConfigStatement;
+use crate::sql::statements::define::{ApiAction, DefineConfigStatement};
+use crate::sql::statements::DefineApiStatement;
 use crate::sql::{RunAs, RunAsKind, Value};
+use crate::syn::error::bail;
 use crate::{
 	sql::{
 		access_type,
@@ -48,6 +52,7 @@ impl Parser<'_> {
 			t!("SCOPE") => self.parse_define_scope(ctx).await.map(DefineStatement::Access),
 			t!("PARAM") => self.parse_define_param(ctx).await.map(DefineStatement::Param),
 			t!("TABLE") => self.parse_define_table(ctx).await.map(DefineStatement::Table),
+			t!("API") => self.parse_define_api(ctx).await.map(DefineStatement::Api),
 			t!("EVENT") => {
 				ctx.run(|ctx| self.parse_define_event(ctx)).await.map(DefineStatement::Event)
 			}
@@ -59,7 +64,7 @@ impl Parser<'_> {
 			}
 			t!("ANALYZER") => self.parse_define_analyzer().map(DefineStatement::Analyzer),
 			t!("ACCESS") => self.parse_define_access(ctx).await.map(DefineStatement::Access),
-			t!("CONFIG") => self.parse_define_config().map(DefineStatement::Config),
+			t!("CONFIG") => self.parse_define_config(ctx).await.map(DefineStatement::Config),
 			_ => unexpected!(self, next, "a define statement keyword"),
 		}
 	}
@@ -387,15 +392,45 @@ impl Parser<'_> {
 									_ => break,
 								}
 							}
-							if self.eat(t!("WITH")) {
-								expected!(self, t!("JWT"));
-								ac.jwt = self.parse_jwt()?;
+							while self.eat(t!("WITH")) {
+								match self.peek_kind() {
+									t!("JWT") => {
+										self.pop_peek();
+										let jwt = self.parse_jwt()?;
+										ac.jwt = jwt.clone();
+										// Use same issuer for refreshed tokens.
+										if let Some(mut bearer) = ac.bearer {
+											bearer.jwt = jwt;
+											ac.bearer = Some(bearer);
+										}
+									}
+									t!("REFRESH") => {
+										// TODO(gguillemas): Remove this once bearer access is no longer experimental.
+										if !self.settings.bearer_access_enabled {
+											unexpected!(
+												self,
+												peek,
+												"the experimental bearer access feature to be enabled"
+											);
+										}
+
+										self.pop_peek();
+										ac.bearer = Some(access_type::BearerAccess {
+											kind: access_type::BearerAccessType::Refresh,
+											subject: access_type::BearerAccessSubject::Record,
+											// Use same issuer for refreshed tokens.
+											jwt: ac.jwt.clone(),
+										});
+									}
+									_ => break,
+								}
+								self.eat(t!(","));
 							}
 							res.kind = AccessType::Record(ac);
 						}
 						t!("BEARER") => {
 							// TODO(gguillemas): Remove this once bearer access is no longer experimental.
-							if !*EXPERIMENTAL_BEARER_ACCESS {
+							if !self.settings.bearer_access_enabled {
 								unexpected!(
 									self,
 									peek,
@@ -792,6 +827,93 @@ impl Parser<'_> {
 		Ok(res)
 	}
 
+	pub async fn parse_define_api(&mut self, ctx: &mut Stk) -> ParseResult<DefineApiStatement> {
+		if !self.settings.define_api_enabled {
+			bail!("Cannot define an API, as the experimental define api capability is not enabled", @self.last_span);
+		}
+
+		let (if_not_exists, overwrite) = if self.eat(t!("IF")) {
+			expected!(self, t!("NOT"));
+			expected!(self, t!("EXISTS"));
+			(true, false)
+		} else if self.eat(t!("OVERWRITE")) {
+			(false, true)
+		} else {
+			(false, false)
+		};
+
+		let path = ctx.run(|ctx| self.parse_value_field(ctx)).await?;
+
+		let config = match self.parse_api_config(ctx).await? {
+			v if v.is_empty() => None,
+			v => Some(v),
+		};
+
+		let mut res = DefineApiStatement {
+			path,
+			if_not_exists,
+			overwrite,
+			config,
+			..Default::default()
+		};
+
+		loop {
+			if !self.eat(t!("FOR")) {
+				break;
+			}
+
+			match self.peek().kind {
+				t!("ANY") => {
+					self.pop_peek();
+					res.fallback = Some(ctx.run(|ctx| self.parse_value_field(ctx)).await?);
+				}
+				t!("DELETE") | t!("GET") | t!("PATCH") | t!("POST") | t!("PUT") | t!("TRACE") => {
+					let mut methods: Vec<Method> = vec![];
+					'methods: loop {
+						let method = match self.peek().kind {
+							t!("DELETE") => Method::Delete,
+							t!("GET") => Method::Get,
+							t!("PATCH") => Method::Patch,
+							t!("POST") => Method::Post,
+							t!("PUT") => Method::Put,
+							t!("TRACE") => Method::Trace,
+							found => {
+								bail!("Expected one of `delete`, `get`, `patch`, `post`, `put` or `trace`, found {found}");
+							}
+						};
+
+						self.pop_peek();
+						methods.push(method);
+
+						if !self.eat(t!(",")) {
+							break 'methods;
+						}
+					}
+
+					let config = match self.parse_api_config(ctx).await? {
+						v if v.is_empty() => None,
+						v => Some(v),
+					};
+
+					expected!(self, t!("THEN"));
+					let action = ctx.run(|ctx| self.parse_value_field(ctx)).await?;
+					res.actions.push(ApiAction {
+						methods,
+						action,
+						config,
+					});
+				}
+				found => {
+					bail!(
+						"Expected one of `any`, `delete`, `get`, `patch`, `post`, `put` or `trace`, found {found}"
+					);
+				}
+			}
+		}
+
+		Ok(res)
+	}
+
 	pub async fn parse_define_event(&mut self, ctx: &mut Stk) -> ParseResult<DefineEventStatement> {
 		let (if_not_exists, overwrite) = if self.eat(t!("IF")) {
 			expected!(self, t!("NOT"));
@@ -887,6 +1009,10 @@ impl Parser<'_> {
 				}
 				t!("DEFAULT") => {
 					self.pop_peek();
+					if self.eat(t!("ALWAYS")) {
+						res.default_always = true;
+					}
+
 					res.default = Some(ctx.run(|ctx| self.parse_value_field(ctx)).await?);
 				}
 				t!("PERMISSIONS") => {
@@ -896,6 +1022,17 @@ impl Parser<'_> {
 				t!("COMMENT") => {
 					self.pop_peek();
 					res.comment = Some(self.next_token_value()?);
+				}
+				t!("REFERENCE") => {
+					if !self.settings.references_enabled {
+						bail!(
+							"Experimental capability `record_references` is not enabled",
+							@self.last_span() => "Use of `REFERENCE` keyword is still experimental"
+						)
+					}
+
+					self.pop_peek();
+					res.reference = Some(self.parse_reference(ctx).await?);
 				}
 				_ => break,
 			}
@@ -1285,7 +1422,10 @@ impl Parser<'_> {
 		Ok(res)
 	}
 
-	pub fn parse_define_config(&mut self) -> ParseResult<DefineConfigStatement> {
+	pub async fn parse_define_config(
+		&mut self,
+		stk: &mut Stk,
+	) -> ParseResult<DefineConfigStatement> {
 		let (if_not_exists, overwrite) = if self.eat(t!("IF")) {
 			expected!(self, t!("NOT"));
 			expected!(self, t!("EXISTS"));
@@ -1298,6 +1438,7 @@ impl Parser<'_> {
 
 		let next = self.next();
 		let inner = match next.kind {
+			t!("API") => self.parse_api_config(stk).await.map(ConfigInner::Api)?,
 			t!("GRAPHQL") => self.parse_graphql_config().map(ConfigInner::GraphQL)?,
 			_ => unexpected!(self, next, "a type of config"),
 		};
@@ -1307,6 +1448,68 @@ impl Parser<'_> {
 			if_not_exists,
 			overwrite,
 		})
+	}
+
+	pub async fn parse_api_config(&mut self, stk: &mut Stk) -> ParseResult<ApiConfig> {
+		let mut config = ApiConfig::default();
+		loop {
+			match self.peek_kind() {
+				t!("PERMISSIONS") => {
+					self.pop_peek();
+					config.permissions = Some(self.parse_permission_value(stk).await?);
+				}
+				t!("MIDDLEWARE") => {
+					self.pop_peek();
+
+					let mut middleware: Vec<(String, Vec<Value>)> = Vec::new();
+					// let mut parsed_custom = false;
+
+					loop {
+						let mut name = match self.peek_kind() {
+							t!("API") => {
+								// if parsed_custom {
+								// 	bail!("Cannot specify builtin middlewares after custom middlewares");
+								// }
+
+								self.pop_peek();
+								expected!(self, t!("::"));
+								"api::".to_string()
+							}
+							t!("fn") => {
+								bail!("Custom middlewares are not yet supported")
+							}
+							_ => {
+								break;
+							}
+						};
+
+						let part = self.next_token_value::<Ident>()?;
+						name.push_str(part.0.to_lowercase().as_str());
+
+						while self.eat(t!("::")) {
+							let part = self.next_token_value::<Ident>()?;
+							name.push_str("::");
+							name.push_str(part.0.to_lowercase().as_str());
+						}
+
+						expected!(self, t!("("));
+						let args = self.parse_function_args(stk).await?;
+
+						middleware.push((name, args));
+
+						if !self.eat(t!(",")) {
+							break;
+						}
+					}
+
+					config.middleware = Some(RequestMiddleware(middleware));
+				}
+				_ => {
+					break;
+				}
+			}
+		}
+		Ok(config)
 	}
 
 	fn parse_graphql_config(&mut self) -> ParseResult<GraphQLConfig> {

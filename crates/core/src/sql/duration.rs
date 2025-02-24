@@ -250,9 +250,9 @@ impl TryAdd for Duration {
 	}
 }
 
-impl<'a> ops::Add<&'a Duration> for &Duration {
+impl<'b> ops::Add<&'b Duration> for &Duration {
 	type Output = Duration;
-	fn add(self, other: &'a Duration) -> Duration {
+	fn add(self, other: &'b Duration) -> Duration {
 		match self.0.checked_add(other.0) {
 			Some(v) => Duration::from(v),
 			None => Duration::from(time::Duration::MAX),
@@ -260,9 +260,9 @@ impl<'a> ops::Add<&'a Duration> for &Duration {
 	}
 }
 
-impl<'a> TryAdd<&'a Duration> for &Duration {
+impl<'b> TryAdd<&'b Duration> for &Duration {
 	type Output = Duration;
-	fn try_add(self, other: &'a Duration) -> Result<Duration, Error> {
+	fn try_add(self, other: &'b Duration) -> Result<Duration, Error> {
 		self.0
 			.checked_add(other.0)
 			.ok_or_else(|| Error::ArithmeticOverflow(format!("{self} + {other}")))
@@ -290,9 +290,9 @@ impl TrySub for Duration {
 	}
 }
 
-impl<'a> ops::Sub<&'a Duration> for &Duration {
+impl<'b> ops::Sub<&'b Duration> for &Duration {
 	type Output = Duration;
-	fn sub(self, other: &'a Duration) -> Duration {
+	fn sub(self, other: &'b Duration) -> Duration {
 		match self.0.checked_sub(other.0) {
 			Some(v) => Duration::from(v),
 			None => Duration::default(),
@@ -300,9 +300,9 @@ impl<'a> ops::Sub<&'a Duration> for &Duration {
 	}
 }
 
-impl<'a> TrySub<&'a Duration> for &Duration {
+impl<'b> TrySub<&'b Duration> for &Duration {
 	type Output = Duration;
-	fn try_sub(self, other: &'a Duration) -> Result<Duration, Error> {
+	fn try_sub(self, other: &'b Duration) -> Result<Duration, Error> {
 		self.0
 			.checked_sub(other.0)
 			.ok_or_else(|| Error::ArithmeticNegativeOverflow(format!("{self} - {other}")))

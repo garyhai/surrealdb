@@ -9,6 +9,7 @@ pub(crate) mod array;
 pub(crate) mod base;
 pub(crate) mod block;
 pub(crate) mod bytes;
+pub(crate) mod bytesize;
 pub(crate) mod cast;
 pub(crate) mod change_feed_include;
 pub(crate) mod changefeed;
@@ -52,6 +53,7 @@ pub(crate) mod paths;
 pub(crate) mod permission;
 pub(crate) mod query;
 pub(crate) mod range;
+pub(crate) mod reference;
 pub(crate) mod regex;
 pub(crate) mod run_as;
 pub(crate) mod scoring;
@@ -73,7 +75,6 @@ pub(crate) mod version;
 pub(crate) mod view;
 pub(crate) mod with;
 
-#[doc(hidden)]
 pub mod index;
 
 pub mod serde;
@@ -88,6 +89,7 @@ pub use self::base::Base;
 pub use self::block::Block;
 pub use self::block::Entry;
 pub use self::bytes::Bytes;
+pub use self::bytesize::Bytesize;
 pub use self::cast::Cast;
 pub use self::changefeed::ChangeFeed;
 pub use self::closure::Closure;
@@ -152,7 +154,6 @@ pub use self::thing::Thing;
 pub use self::timeout::Timeout;
 pub use self::tokenizer::Tokenizer;
 pub use self::uuid::Uuid;
-#[doc(hidden)]
 pub use self::value::serde::from_value;
 pub use self::value::serde::to_value;
 pub use self::value::Value;
@@ -162,7 +163,6 @@ pub use self::view::View;
 pub use self::with::With;
 
 // module reexporting parsing function to prevent a breaking change.
-#[doc(hidden)]
 mod parser {
 	pub use crate::syn::*;
 }

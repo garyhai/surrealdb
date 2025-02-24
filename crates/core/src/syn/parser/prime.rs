@@ -140,7 +140,8 @@ impl Parser<'_> {
 				}
 			}
 
-			let value = Value::Function(Box::new(Function::Anonymous(subject.clone(), args)));
+			let value =
+				Value::Function(Box::new(Function::Anonymous(subject.clone(), args, false)));
 			let value = ctx.run(|ctx| self.try_parse_inline(ctx, &value)).await?.unwrap_or(value);
 			Ok(Some(value))
 		} else {
@@ -237,7 +238,7 @@ impl Parser<'_> {
 			}
 			t!("'") | t!("\"") | TokenKind::Glued(Glued::Strand) => {
 				let s = self.next_token_value::<Strand>()?;
-				if self.legacy_strands {
+				if self.settings.legacy_strands {
 					if let Some(x) = self.reparse_legacy_strand(ctx, &s.0).await {
 						return Ok(x);
 					}

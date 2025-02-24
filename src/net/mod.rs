@@ -1,3 +1,4 @@
+mod api;
 mod auth;
 pub mod client_ip;
 mod export;
@@ -21,7 +22,7 @@ mod tracer;
 mod version;
 
 use crate::cli::CF;
-use crate::cnf::{self, GRAPHQL_ENABLE};
+use crate::cnf;
 use crate::err::Error;
 use crate::net::signals::graceful_shutdown;
 use crate::rpc::{notifications, RpcState};
@@ -36,6 +37,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use surrealdb::dbs::capabilities::ExperimentalTarget;
 use surrealdb::headers::{AUTH_DB, AUTH_NS, DB, ID, NS};
 use surrealdb::kvs::Datastore;
 use tokio_util::sync::CancellationToken;
@@ -84,9 +86,14 @@ pub async fn init(ds: Arc<Datastore>, ct: CancellationToken) -> Result<(), Error
 
 	// Build the middleware to our service.
 	let service = ServiceBuilder::new()
+		// Ensure any panics are caught and handled
 		.catch_panic()
+		// Ensure a X-Request-Id header is specified
 		.set_x_request_id(MakeRequestUuid)
-		.propagate_x_request_id();
+		// Ensure the Request-Id is sent in the response
+		.propagate_x_request_id()
+		// Limit the number of requests handled at once
+		.concurrency_limit(*cnf::NET_MAX_CONCURRENT_REQUESTS);
 
 	#[cfg(feature = "http-compression")]
 	let service = service.layer(
@@ -143,6 +150,7 @@ pub async fn init(ds: Arc<Datastore>, ct: CancellationToken) -> Result<(), Error
 		.layer(AsyncRequireAuthorizationLayer::new(auth::SurrealAuth))
 		.layer(headers::add_server_header(!opt.no_identification_headers))
 		.layer(headers::add_version_header(!opt.no_identification_headers))
+		// Apply CORS headers to relevant responses
 		.layer(
 			CorsLayer::new()
 				.allow_methods([
@@ -173,9 +181,10 @@ pub async fn init(ds: Arc<Datastore>, ct: CancellationToken) -> Result<(), Error
 		.merge(signin::router())
 		.merge(signup::router())
 		.merge(key::router())
-		.merge(ml::router());
+		.merge(ml::router())
+		.merge(api::router());
 
-	let axum_app = if *GRAPHQL_ENABLE {
+	let axum_app = if ds.get_capabilities().allows_experimental(&ExperimentalTarget::GraphQL) {
 		#[cfg(surrealdb_unstable)]
 		{
 			warn!("❌🔒IMPORTANT: GraphQL is a pre-release feature with known security flaws. This is not recommended for production use.🔒❌");

@@ -6,8 +6,10 @@ use crate::err::Error;
 use crate::iam::Action;
 use crate::iam::ResourceKind;
 use crate::idx::planner::iterators::IteratorRecord;
+use crate::idx::planner::RecordStrategy;
 use crate::kvs::cache;
 use crate::sql::permission::Permission;
+use crate::sql::statements::define::DefineDatabaseStatement;
 use crate::sql::statements::define::DefineEventStatement;
 use crate::sql::statements::define::DefineFieldStatement;
 use crate::sql::statements::define::DefineIndexStatement;
@@ -35,6 +37,7 @@ pub(crate) struct Document {
 	pub(super) current: CursorDoc,
 	pub(super) initial_reduced: CursorDoc,
 	pub(super) current_reduced: CursorDoc,
+	pub(super) record_strategy: RecordStrategy,
 }
 
 #[non_exhaustive]
@@ -159,12 +162,6 @@ impl Debug for Document {
 	}
 }
 
-impl From<&Document> for Vec<u8> {
-	fn from(val: &Document) -> Vec<u8> {
-		val.current.doc.as_ref().into()
-	}
-}
-
 pub(crate) enum Permitted {
 	Initial,
 	Current,
@@ -180,6 +177,7 @@ impl Document {
 		val: Arc<Value>,
 		extras: Workable,
 		retry: bool,
+		rs: RecordStrategy,
 	) -> Self {
 		Document {
 			id: id.clone(),
@@ -190,6 +188,7 @@ impl Document {
 			initial: CursorDoc::new(id.clone(), ir.clone(), val.clone()),
 			current_reduced: CursorDoc::new(id.clone(), ir.clone(), val.clone()),
 			initial_reduced: CursorDoc::new(id.clone(), ir.clone(), val.clone()),
+			record_strategy: rs,
 		}
 	}
 
@@ -249,6 +248,11 @@ impl Document {
 			Workable::Normal if self.gen.is_none() => true,
 			_ => false,
 		}
+	}
+
+	/// Retur true if the document has been extracted by an iterator that already matcheed the condition.
+	pub(crate) fn is_condition_checked(&self) -> bool {
+		matches!(self.record_strategy, RecordStrategy::Count | RecordStrategy::KeysOnly)
 	}
 
 	/// Checks if permissions are required to be run
@@ -358,33 +362,102 @@ impl Document {
 		}
 	}
 
+	/// Get the database for this document
+	pub async fn db(
+		&self,
+		ctx: &Context,
+		opt: &Options,
+	) -> Result<Arc<DefineDatabaseStatement>, Error> {
+		// Get the NS + DB
+		let (ns, db) = opt.ns_db()?;
+		// Get transaction
+		let txn = ctx.tx();
+		// Get the table definition
+		match ctx.get_cache() {
+			// A cache is present on the context
+			Some(cache) if txn.local() => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Db(ns, db);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = txn.get_or_add_db(ns, db, opt.strict).await?;
+						let val = cache::ds::Entry::Any(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
+				}
+				.try_into_type()
+			}
+			// No cache is present on the context
+			_ => txn.get_or_add_db(ns, db, opt.strict).await,
+		}
+	}
+
 	/// Get the table for this document
 	pub async fn tb(
 		&self,
 		ctx: &Context,
 		opt: &Options,
 	) -> Result<Arc<DefineTableStatement>, Error> {
-		// Get transaction
-		let txn = ctx.tx();
+		// Get the NS + DB
+		let (ns, db) = opt.ns_db()?;
 		// Get the record id
 		let id = self.id()?;
+		// Get transaction
+		let txn = ctx.tx();
 		// Get the table definition
-		let tb = txn.get_tb(opt.ns()?, opt.db()?, &id.tb).await;
-		// Return the table or attempt to define it
-		match tb {
-			// The table doesn't exist
-			Err(Error::TbNotFound {
-				value: _,
-			}) => {
-				// Allowed to run?
-				opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
-				// We can create the table automatically
-				txn.ensure_ns_db_tb(opt.ns()?, opt.db()?, &id.tb, opt.strict).await
+		match ctx.get_cache() {
+			// A cache is present on the context
+			Some(cache) if txn.local() => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Tb(ns, db, &id.tb);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = match txn.get_tb(ns, db, &id.tb).await {
+							// The table doesn't exist
+							Err(Error::TbNotFound {
+								name: _,
+							}) => {
+								// Allowed to run?
+								opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
+								// We can create the table automatically
+								txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+							}
+							// There was an error
+							Err(err) => Err(err),
+							// The table exists
+							Ok(tb) => Ok(tb),
+						}?;
+						let val = cache::ds::Entry::Any(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
+				}
+				.try_into_type()
 			}
-			// There was an error
-			Err(err) => Err(err),
-			// The table exists
-			Ok(tb) => Ok(tb),
+			// No cache is present on the context
+			_ => {
+				// Return the table or attempt to define it
+				match txn.get_tb(ns, db, &id.tb).await {
+					// The table doesn't exist
+					Err(Error::TbNotFound {
+						name: _,
+					}) => {
+						// Allowed to run?
+						opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
+						// We can create the table automatically
+						txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+					}
+					// There was an error
+					Err(err) => Err(err),
+					// The table exists
+					Ok(tb) => Ok(tb),
+				}
+			}
 		}
 	}
 
@@ -395,22 +468,24 @@ impl Document {
 		opt: &Options,
 	) -> Result<Arc<[DefineTableStatement]>, Error> {
 		// Get the NS + DB
-		let ns = opt.ns()?;
-		let db = opt.db()?;
+		let (ns, db) = opt.ns_db()?;
 		// Get the document table
 		let tb = self.tb(ctx, opt).await?;
-		// Get or update the cache entry
-		let key = cache::ds::Lookup::Fts(ns, db, &tb.name, tb.cache_tables_ts);
 		// Get the cache from the context
 		match ctx.get_cache() {
 			// A cache is present on the context
-			Some(cache) => match cache.get(&key) {
-				Some(val) => val,
-				None => {
-					let val = ctx.tx().all_tb_views(ns, db, &tb.name).await?;
-					let val = cache::ds::Entry::Fts(val.clone());
-					cache.insert(key.into(), val.clone());
-					val
+			Some(cache) => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Fts(ns, db, &tb.name, tb.cache_tables_ts);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = ctx.tx().all_tb_views(ns, db, &tb.name).await?;
+						let val = cache::ds::Entry::Fts(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
 				}
 			}
 			.try_into_fts(),
@@ -426,22 +501,24 @@ impl Document {
 		opt: &Options,
 	) -> Result<Arc<[DefineEventStatement]>, Error> {
 		// Get the NS + DB
-		let ns = opt.ns()?;
-		let db = opt.db()?;
+		let (ns, db) = opt.ns_db()?;
 		// Get the document table
 		let tb = self.tb(ctx, opt).await?;
-		// Get or update the cache entry
-		let key = cache::ds::Lookup::Evs(ns, db, &tb.name, tb.cache_events_ts);
 		// Get the cache from the context
 		match ctx.get_cache() {
 			// A cache is present on the context
-			Some(cache) => match cache.get(&key) {
-				Some(val) => val,
-				None => {
-					let val = ctx.tx().all_tb_events(ns, db, &tb.name).await?;
-					let val = cache::ds::Entry::Evs(val.clone());
-					cache.insert(key.into(), val.clone());
-					val
+			Some(cache) => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Evs(ns, db, &tb.name, tb.cache_events_ts);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = ctx.tx().all_tb_events(ns, db, &tb.name).await?;
+						let val = cache::ds::Entry::Evs(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
 				}
 			}
 			.try_into_evs(),
@@ -457,22 +534,24 @@ impl Document {
 		opt: &Options,
 	) -> Result<Arc<[DefineFieldStatement]>, Error> {
 		// Get the NS + DB
-		let ns = opt.ns()?;
-		let db = opt.db()?;
+		let (ns, db) = opt.ns_db()?;
 		// Get the document table
 		let tb = self.tb(ctx, opt).await?;
-		// Get or update the cache entry
-		let key = cache::ds::Lookup::Fds(ns, db, &tb.name, tb.cache_fields_ts);
 		// Get the cache from the context
 		match ctx.get_cache() {
 			// A cache is present on the context
-			Some(cache) => match cache.get(&key) {
-				Some(val) => val,
-				None => {
-					let val = ctx.tx().all_tb_fields(ns, db, &tb.name, opt.version).await?;
-					let val = cache::ds::Entry::Fds(val.clone());
-					cache.insert(key.into(), val.clone());
-					val
+			Some(cache) => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Fds(ns, db, &tb.name, tb.cache_fields_ts);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = ctx.tx().all_tb_fields(ns, db, &tb.name, opt.version).await?;
+						let val = cache::ds::Entry::Fds(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
 				}
 			}
 			.try_into_fds(),
@@ -488,22 +567,24 @@ impl Document {
 		opt: &Options,
 	) -> Result<Arc<[DefineIndexStatement]>, Error> {
 		// Get the NS + DB
-		let ns = opt.ns()?;
-		let db = opt.db()?;
+		let (ns, db) = opt.ns_db()?;
 		// Get the document table
 		let tb = self.tb(ctx, opt).await?;
-		// Get or update the cache entry
-		let key = cache::ds::Lookup::Ixs(ns, db, &tb.name, tb.cache_indexes_ts);
 		// Get the cache from the context
 		match ctx.get_cache() {
 			// A cache is present on the context
-			Some(cache) => match cache.get(&key) {
-				Some(val) => val,
-				None => {
-					let val = ctx.tx().all_tb_indexes(ns, db, &tb.name).await?;
-					let val = cache::ds::Entry::Ixs(val.clone());
-					cache.insert(key.into(), val.clone());
-					val
+			Some(cache) => {
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Ixs(ns, db, &tb.name, tb.cache_indexes_ts);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = ctx.tx().all_tb_indexes(ns, db, &tb.name).await?;
+						let val = cache::ds::Entry::Ixs(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
 				}
 			}
 			.try_into_ixs(),
@@ -515,25 +596,29 @@ impl Document {
 	// Get the lives for this document
 	pub async fn lv(&self, ctx: &Context, opt: &Options) -> Result<Arc<[LiveStatement]>, Error> {
 		// Get the NS + DB
-		let ns = opt.ns()?;
-		let db = opt.db()?;
+		let (ns, db) = opt.ns_db()?;
 		// Get the document table
 		let tb = self.tb(ctx, opt).await?;
-		// Get or update the cache entry
-		let key = cache::ds::Lookup::Lvs(ns, db, &tb.name, tb.cache_lives_ts);
 		// Get the cache from the context
 		match ctx.get_cache() {
 			// A cache is present on the context
-			Some(cache) => match cache.get(&key) {
-				Some(val) => val,
-				None => {
-					let val = ctx.tx().all_tb_lives(ns, db, &tb.name).await?;
-					let val = cache::ds::Entry::Lvs(val.clone());
-					cache.insert(key.into(), val.clone());
-					val
+			Some(cache) => {
+				// Get the live-queries cache version
+				let version = cache.get_live_queries_version(ns, db, &tb.name)?;
+				// Get the cache entry key
+				let key = cache::ds::Lookup::Lvs(ns, db, &tb.name, version);
+				// Get or update the cache entry
+				match cache.get(&key) {
+					Some(val) => val,
+					None => {
+						let val = ctx.tx().all_tb_lives(ns, db, &tb.name).await?;
+						let val = cache::ds::Entry::Lvs(val.clone());
+						cache.insert(key, val.clone());
+						val
+					}
 				}
+				.try_into_lvs()
 			}
-			.try_into_lvs(),
 			// No cache is present on the context
 			None => ctx.tx().all_tb_lives(ns, db, &tb.name).await,
 		}

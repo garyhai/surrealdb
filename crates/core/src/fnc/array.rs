@@ -62,7 +62,7 @@ pub async fn all(
 			if let Some(opt) = opt {
 				for val in array.iter() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						continue;
 					} else {
@@ -88,7 +88,7 @@ pub async fn any(
 			if let Some(opt) = opt {
 				for val in array.iter() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						return Ok(Value::Bool(true));
 					} else {
@@ -124,9 +124,8 @@ pub fn boolean_and((lh, rh): (Array, Array)) -> Result<Value, Error> {
 	for i in 0..longest_length {
 		let lhv = lh.get(i);
 		let rhv = rh.get(i);
-		results.push(
-			(lhv.map_or(false, |v| v.is_truthy()) && rhv.map_or(false, |v| v.is_truthy())).into(),
-		);
+		results
+			.push((lhv.is_some_and(Value::is_truthy) && rhv.is_some_and(Value::is_truthy)).into());
 	}
 	Ok(results.into())
 }
@@ -142,9 +141,8 @@ pub fn boolean_or((lh, rh): (Array, Array)) -> Result<Value, Error> {
 	for i in 0..longest_length {
 		let lhv = lh.get(i);
 		let rhv = rh.get(i);
-		results.push(
-			(lhv.map_or(false, |v| v.is_truthy()) || rhv.map_or(false, |v| v.is_truthy())).into(),
-		);
+		results
+			.push((lhv.is_some_and(Value::is_truthy) || rhv.is_some_and(Value::is_truthy)).into());
 	}
 	Ok(results.into())
 }
@@ -155,9 +153,8 @@ pub fn boolean_xor((lh, rh): (Array, Array)) -> Result<Value, Error> {
 	for i in 0..longest_length {
 		let lhv = lh.get(i);
 		let rhv = rh.get(i);
-		results.push(
-			(lhv.map_or(false, |v| v.is_truthy()) ^ rhv.map_or(false, |v| v.is_truthy())).into(),
-		);
+		results
+			.push((lhv.is_some_and(Value::is_truthy) ^ rhv.is_some_and(Value::is_truthy)).into());
 	}
 	Ok(results.into())
 }
@@ -247,7 +244,7 @@ pub async fn filter(
 				let mut res = Vec::with_capacity(array.len());
 				for val in array.iter() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg.clone()]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg.clone()], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						res.push(arg)
 					}
@@ -271,7 +268,7 @@ pub async fn filter_index(
 				let mut res = Vec::with_capacity(array.len());
 				for (i, val) in array.iter().enumerate() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg, i.into()]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg, i.into()], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						res.push(i);
 					}
@@ -305,7 +302,7 @@ pub async fn find(
 			if let Some(opt) = opt {
 				for val in array.iter() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg.clone()]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg.clone()], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						return Ok(arg);
 					}
@@ -328,7 +325,7 @@ pub async fn find_index(
 			if let Some(opt) = opt {
 				for (i, val) in array.iter().enumerate() {
 					let arg = val.compute(stk, ctx, opt, doc).await?;
-					let fnc = Function::Anonymous(closure.clone(), vec![arg, i.into()]);
+					let fnc = Function::Anonymous(closure.clone(), vec![arg, i.into()], true);
 					if fnc.compute(stk, ctx, opt, doc).await?.is_truthy() {
 						return Ok(i.into());
 					}
@@ -371,7 +368,7 @@ pub async fn fold(
 	if let Some(opt) = opt {
 		let mut accum = init;
 		for (i, val) in array.into_iter().enumerate() {
-			let fnc = Function::Anonymous(mapper.clone().into(), vec![accum, val, i.into()]);
+			let fnc = Function::Anonymous(mapper.clone().into(), vec![accum, val, i.into()], true);
 			accum = fnc.compute(stk, ctx, opt, doc).await?;
 		}
 		Ok(accum)
@@ -511,7 +508,7 @@ pub async fn map(
 		let mut res = Vec::with_capacity(array.len());
 		for (i, val) in array.into_iter().enumerate() {
 			let arg = val.compute(stk, ctx, opt, doc).await?;
-			let fnc = Function::Anonymous(mapper.clone().into(), vec![arg, i.into()]);
+			let fnc = Function::Anonymous(mapper.clone().into(), vec![arg, i.into()], true);
 			res.push(fnc.compute(stk, ctx, opt, doc).await?);
 		}
 		Ok(res.into())
@@ -588,8 +585,11 @@ pub async fn reduce(
 					return Ok(Value::None);
 				};
 				for (idx, val) in iter.enumerate() {
-					let fnc =
-						Function::Anonymous(mapper.clone().into(), vec![accum, val, idx.into()]);
+					let fnc = Function::Anonymous(
+						mapper.clone().into(),
+						vec![accum, val, idx.into()],
+						true,
+					);
 					accum = fnc.compute(stk, ctx, opt, doc).await?;
 				}
 				Ok(accum)

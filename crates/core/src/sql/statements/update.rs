@@ -2,15 +2,16 @@ use crate::ctx::{Context, MutableContext};
 use crate::dbs::{Iterator, Options, Statement};
 use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::idx::planner::RecordStrategy;
 use crate::sql::{Cond, Data, Output, Timeout, Value, Values};
-use derive::Store;
+
 use reblessive::tree::Stk;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[revisioned(revision = 2)]
-#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Store, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Hash)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub struct UpdateStatement {
@@ -67,7 +68,7 @@ impl UpdateStatement {
 			})?;
 		}
 		// Process the statement
-		let res = i.output(stk, &ctx, opt, &stm).await?;
+		let res = i.output(stk, &ctx, opt, &stm, RecordStrategy::KeysAndValues).await?;
 		// Catch statement timeout
 		if ctx.is_timedout() {
 			return Err(Error::QueryTimedout);

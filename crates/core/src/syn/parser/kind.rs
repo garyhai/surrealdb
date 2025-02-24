@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use reblessive::Stk;
 
 use crate::{
-	sql::{kind::Literal, Duration, Kind, Strand},
+	sql::{kind::Literal, Duration, Idiom, Kind, Strand, Table},
 	syn::{
+		error::bail,
 		lexer::compound,
 		parser::mac::expected,
 		token::{t, Glued, Keyword, Span, TokenKind},
@@ -18,14 +19,14 @@ impl Parser<'_> {
 	///
 	/// # Parser State
 	/// expects the first `<` to already be eaten
-	pub(super) async fn parse_kind(&mut self, ctx: &mut Stk, delim: Span) -> ParseResult<Kind> {
+	pub(crate) async fn parse_kind(&mut self, ctx: &mut Stk, delim: Span) -> ParseResult<Kind> {
 		let kind = self.parse_inner_kind(ctx).await?;
 		self.expect_closing_delimiter(t!(">"), delim)?;
 		Ok(kind)
 	}
 
 	/// Parse an inner kind, a kind without enclosing `<` `>`.
-	pub(super) async fn parse_inner_kind(&mut self, ctx: &mut Stk) -> ParseResult<Kind> {
+	pub(crate) async fn parse_inner_kind(&mut self, ctx: &mut Stk) -> ParseResult<Kind> {
 		match self.parse_inner_single_kind(ctx).await? {
 			Kind::Any => Ok(Kind::Any),
 			Kind::Option(k) => Ok(Kind::Option(k)),
@@ -145,6 +146,31 @@ impl Parser<'_> {
 					Ok(Kind::Set(Box::new(Kind::Any), None))
 				}
 			}
+			t!("REFERENCES") => {
+				if !self.settings.references_enabled {
+					bail!(
+						"Experimental capability `record_references` is not enabled",
+						@self.last_span() => "Use of `REFERENCES` keyword is still experimental"
+					)
+				}
+
+				let span = self.peek().span;
+				let (table, path) = if self.eat(t!("<")) {
+					let table: Option<Table> = Some(self.next_token_value()?);
+					let path: Option<Idiom> = if self.eat(t!(",")) {
+						Some(self.parse_local_idiom(ctx).await?)
+					} else {
+						None
+					};
+
+					self.expect_closing_delimiter(t!(">"), span)?;
+					(table, path)
+				} else {
+					(None, None)
+				};
+
+				Ok(Kind::References(table, path))
+			}
 			_ => unexpected!(self, next, "a kind name"),
 		}
 	}
@@ -252,7 +278,6 @@ mod tests {
 	fn kind_null() {
 		let sql = "null";
 		let res = kind(sql);
-		assert!(res.is_ok());
 		let out = res.unwrap();
 		assert_eq!("null", format!("{}", out));
 		assert_eq!(out, Kind::Null);

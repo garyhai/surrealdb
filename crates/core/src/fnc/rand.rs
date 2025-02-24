@@ -2,7 +2,7 @@ use crate::cnf::ID_CHARS;
 use crate::err::Error;
 use crate::sql::uuid::Uuid;
 use crate::sql::value::Value;
-use crate::sql::Datetime;
+use crate::sql::{Datetime, Number};
 use chrono::{TimeZone, Utc};
 use nanoid::nanoid;
 use rand::distributions::{Alphanumeric, DistString};
@@ -125,15 +125,39 @@ pub fn string((arg1, arg2): (Option<i64>, Option<i64>)) -> Result<Value, Error> 
 	Ok(Alphanumeric.sample_string(&mut rand::thread_rng(), val).into())
 }
 
-pub fn time((range,): (Option<(i64, i64)>,)) -> Result<Value, Error> {
+pub fn time((range,): (Option<(Value, Value)>,)) -> Result<Value, Error> {
+	// Process the arguments
+	let range = match range {
+		None => None,
+		Some((Value::Number(Number::Int(min)), Value::Number(Number::Int(max)))) => {
+			Some((min, max))
+		}
+		Some((Value::Datetime(min), Value::Datetime(max))) => match (min.to_i64(), max.to_i64()) {
+			(Some(min), Some(max)) => Some((min, max)),
+			_ => {
+				return Err(Error::InvalidArguments {
+					name: String::from("rand::time"),
+					message: String::from("Failed to convert datetime arguments to i64 timestamps"),
+				})
+			}
+		},
+		_ => {
+			return Err(Error::InvalidArguments {
+				name: String::from("rand::time"),
+				message: String::from(
+					"Expected an optional pair of datetimes or pair of i64 numbers to be passed",
+				),
+			})
+		}
+	};
 	// Set the maximum valid seconds
 	const LIMIT: i64 = 8210298412799;
 	// Check the function input arguments
-	let val = if let Some((min, max)) = range {
+	let (min, max) = if let Some((min, max)) = range {
 		match min {
 			min if (1..=LIMIT).contains(&min) => match max {
-				max if min <= max && max <= LIMIT => rand::thread_rng().gen_range(min..=max),
-				max if max >= 1 && max <= min => rand::thread_rng().gen_range(max..=min),
+				max if min <= max && max <= LIMIT => (min, max),
+				max if max >= 1 && max <= min => (max, min),
 				_ => return Err(Error::InvalidArguments {
 					name: String::from("rand::time"),
 					message: format!("To generate a time between X and Y seconds, the 2 arguments must be positive numbers and no higher than {LIMIT}."),
@@ -145,10 +169,11 @@ pub fn time((range,): (Option<(i64, i64)>,)) -> Result<Value, Error> {
 			}),
 		}
 	} else {
-		rand::thread_rng().gen_range(0..=LIMIT)
+		(0, LIMIT)
 	};
 	// Generate the random time, try up to 5 times
 	for _ in 0..5 {
+		let val = rand::thread_rng().gen_range(min..=max);
 		if let Some(v) = Utc.timestamp_opt(val, 0).earliest() {
 			return Ok(v.into());
 		}
@@ -160,7 +185,7 @@ pub fn time((range,): (Option<(i64, i64)>,)) -> Result<Value, Error> {
 pub fn ulid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 	let ulid = match timestamp {
 		Some(timestamp) => {
-			#[cfg(target_arch = "wasm32")]
+			#[cfg(target_family = "wasm")]
 			if timestamp.0 < chrono::DateTime::UNIX_EPOCH {
 				return Err(Error::InvalidArguments {
 					name: String::from("rand::ulid"),
@@ -181,7 +206,7 @@ pub fn ulid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 pub fn uuid((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 	let uuid = match timestamp {
 		Some(timestamp) => {
-			#[cfg(target_arch = "wasm32")]
+			#[cfg(target_family = "wasm")]
 			if timestamp.0 < chrono::DateTime::UNIX_EPOCH {
 				return Err(Error::InvalidArguments {
 					name: String::from("rand::ulid"),
@@ -212,7 +237,7 @@ pub mod uuid {
 	pub fn v7((timestamp,): (Option<Datetime>,)) -> Result<Value, Error> {
 		let uuid = match timestamp {
 			Some(timestamp) => {
-				#[cfg(target_arch = "wasm32")]
+				#[cfg(target_family = "wasm")]
 				if timestamp.0 < chrono::DateTime::UNIX_EPOCH {
 					return Err(Error::InvalidArguments {
 						name: String::from("rand::ulid"),

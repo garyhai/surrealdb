@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{self, AtomicU8};
 
 /// The goal of this structure is to cache parameters so they can be easily passed
-/// from one function to the other, so we don't pass too much arguments.
+/// from one function to the other, so we don't pass too many arguments.
 /// It also caches evaluated fields (like is_keys_only)
 pub(crate) struct StatementContext<'a> {
 	pub(crate) ctx: &'a Context,
@@ -34,7 +34,21 @@ pub(crate) struct StatementContext<'a> {
 	pub(crate) order: Option<&'a Ordering>,
 	pub(crate) cond: Option<&'a Cond>,
 	pub(crate) group: Option<&'a Groups>,
-	is_keys_only: HashMap<String, bool>,
+	is_perm: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecordStrategy {
+	Count,
+	KeysOnly,
+	KeysAndValues,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GrantedPermission {
+	None,
+	Full,
+	Specific,
 }
 
 impl<'a> StatementContext<'a> {
@@ -43,74 +57,125 @@ impl<'a> StatementContext<'a> {
 		opt: &'a Options,
 		stm: &'a Statement<'a>,
 	) -> Result<Self, Error> {
+		let is_perm = opt.check_perms(stm.into())?;
+		let (ns, db) = opt.ns_db()?;
 		Ok(Self {
 			ctx,
 			opt,
-			ns: opt.ns()?,
-			db: opt.db()?,
 			stm,
+			ns,
+			db,
 			fields: stm.expr(),
 			with: stm.with(),
 			order: stm.order(),
 			cond: stm.cond(),
 			group: stm.group(),
-			is_keys_only: HashMap::default(),
+			is_perm,
 		})
 	}
 
-	async fn is_keys_only(&self, tb: &str) -> Result<bool, Error> {
-		if let Some(fields) = self.fields {
-			if !fields.is_count_all_only() {
-				return Ok(false);
+	pub(crate) async fn check_table_permission(
+		&self,
+		tb: &str,
+	) -> Result<GrantedPermission, Error> {
+		if !self.is_perm {
+			return Ok(GrantedPermission::Full);
+		}
+		// Get the table for this planner
+		match self.ctx.tx().get_tb(self.ns, self.db, tb).await {
+			Ok(table) => {
+				// TODO(tobiemh): we should really
+				// not even get here if the table
+				// permissions are NONE, because
+				// there is no point in processing
+				// a table which we can't access.
+				let perms = self.stm.permissions(&table, false);
+				// If permissions are specific, we
+				// need to fetch the record content.
+				if perms.is_specific() {
+					return Ok(GrantedPermission::Specific);
+				}
+				// If permissions are NONE, we also
+				// need to fetch the record content.
+				if perms.is_none() {
+					return Ok(GrantedPermission::None);
+				}
 			}
+			Err(Error::TbNotFound {
+				..
+			}) => {
+				// We can safely ignore this error,
+				// as it just means that there is no
+				// table and no permissions defined.
+			}
+			Err(e) => return Err(e),
 		}
-		if self.cond.is_some() {
-			return Ok(false);
+		Ok(GrantedPermission::Full)
+	}
+
+	pub(crate) async fn check_record_strategy(
+		&self,
+		with_all_indexes: bool,
+		granted_permission: GrantedPermission,
+	) -> Result<RecordStrategy, Error> {
+		// If there is a WHERE clause, then
+		// we need to fetch and process
+		// record content values too.
+		if !with_all_indexes && self.cond.is_some() {
+			return Ok(RecordStrategy::KeysAndValues);
 		}
-		if let Some(g) = self.group {
+
+		// If there is a GROUP BY clause,
+		// and it is not GROUP ALL, then we
+		// need to process record values.
+		let is_group_all = if let Some(g) = self.group {
 			if !g.is_empty() {
-				return Ok(false);
+				return Ok(RecordStrategy::KeysAndValues);
 			}
-		}
+			true
+		} else {
+			false
+		};
+
+		// If there is an ORDER BY clause,
+		// with specific fields, then we
+		// need to process record values.
 		if let Some(p) = self.order {
 			match p {
 				Ordering::Random => {}
 				Ordering::Order(x) => {
-					if !x.0.is_empty() {
-						return Ok(false);
+					if !x.is_empty() {
+						return Ok(RecordStrategy::KeysAndValues);
 					}
 				}
 			}
 		}
-		if self.opt.perms {
-			match self.ctx.tx().get_tb(self.ns, self.db, tb).await {
-				Ok(table) => {
-					let perms = self.stm.permissions(&table, false);
-					if perms.is_specific() {
-						return Ok(false);
-					}
-				}
-				Err(Error::TbNotFound {
-					..
-				}) => {
-					// We can safely ignore this error, as it just means that there are no permissions defined
-				}
-				Err(e) => return Err(e),
-			}
-		}
-		Ok(true)
-	}
 
-	pub(crate) async fn check_keys_only(&mut self, tb: &str) -> Result<bool, Error> {
-		// If we already have evaluated it, we can just return the cached result
-		if let Some(keys) = self.is_keys_only.get(tb) {
-			return Ok(*keys);
+		// If there are any field expressions
+		// defined which are not count() then
+		// we need to process record values.
+		let is_count_all = if let Some(fields) = self.fields {
+			if !fields.is_count_all_only() {
+				return Ok(RecordStrategy::KeysAndValues);
+			}
+			true
+		} else {
+			false
+		};
+
+		// If there are specific permissions
+		// defined on the table, then we need
+		// to process record values.
+		if matches!(granted_permission, GrantedPermission::Specific) {
+			return Ok(RecordStrategy::KeysAndValues);
 		}
-		// Otherwise, we do the evaluation
-		let r = self.is_keys_only(tb).await?;
-		// And store the result in the cache
-		self.is_keys_only.insert(tb.to_string(), r);
-		Ok(r)
+
+		// We just want to count
+		if is_count_all && is_group_all {
+			return Ok(RecordStrategy::Count);
+		}
+		// Otherwise we can iterate over keys only
+		Ok(RecordStrategy::KeysOnly)
 	}
 }
 
@@ -122,6 +187,8 @@ pub(crate) struct QueryPlanner {
 	iteration_workflow: Vec<IterationStage>,
 	iteration_index: AtomicU8,
 	orders: Vec<IteratorRef>,
+	granted_permissions: HashMap<String, GrantedPermission>,
+	any_specific_permission: bool,
 }
 
 impl QueryPlanner {
@@ -133,7 +200,30 @@ impl QueryPlanner {
 			iteration_workflow: Vec::default(),
 			iteration_index: AtomicU8::new(0),
 			orders: vec![],
+			granted_permissions: HashMap::default(),
+			any_specific_permission: false,
 		}
+	}
+
+	/// Check the table permissions and cache the result.
+	/// Keep track of any specific permission.
+	pub(crate) async fn check_table_permission(
+		&mut self,
+		ctx: &StatementContext<'_>,
+		tb: &str,
+	) -> Result<GrantedPermission, Error> {
+		if ctx.is_perm {
+			if let Some(p) = self.granted_permissions.get(tb) {
+				return Ok(*p);
+			}
+			let p = ctx.check_table_permission(tb).await?;
+			self.granted_permissions.insert(tb.to_string(), p);
+			if matches!(p, GrantedPermission::Specific) {
+				self.any_specific_permission = true;
+			}
+			return Ok(p);
+		}
+		Ok(GrantedPermission::Full)
 	}
 
 	pub(crate) async fn add_iterables(
@@ -141,72 +231,73 @@ impl QueryPlanner {
 		stk: &mut Stk,
 		ctx: &StatementContext<'_>,
 		t: Table,
+		gp: GrantedPermission,
 		it: &mut Iterator,
 	) -> Result<(), Error> {
 		let mut is_table_iterator = false;
 
-		let mut tree = Tree::build(stk, ctx, &t).await?;
+		let tree = Tree::build(stk, ctx, &t).await?;
 
 		let is_knn = !tree.knn_expressions.is_empty();
-		let order = tree.index_map.order_limit.take();
 		let mut exe = InnerQueryExecutor::new(
 			stk,
 			ctx.ctx,
 			ctx.opt,
 			&t,
-			tree.index_map,
+			tree.index_map.options,
 			tree.knn_expressions,
 			tree.knn_brute_force_expressions,
 			tree.knn_condition,
 		)
 		.await?;
 		match PlanBuilder::build(
-			&t,
+			gp,
 			tree.root,
 			ctx,
 			tree.with_indexes,
-			order,
+			tree.index_map.compound_indexes,
+			tree.index_map.order_limit,
 			tree.all_and_groups,
 			tree.all_and,
 			tree.all_expressions_with_index,
 		)
 		.await?
 		{
-			Plan::SingleIndex(exp, io) => {
+			Plan::SingleIndex(exp, io, rs) => {
 				if io.require_distinct() {
 					self.requires_distinct = true;
 				}
 				let is_order = exp.is_none();
 				let ir = exe.add_iterator(IteratorEntry::Single(exp, io));
-				self.add(t.clone(), Some(ir), exe, it);
+				self.add(t.clone(), Some(ir), exe, it, rs);
 				if is_order {
 					self.orders.push(ir);
 				}
 			}
-			Plan::MultiIndex(non_range_indexes, ranges_indexes) => {
+			Plan::MultiIndex(non_range_indexes, ranges_indexes, rs) => {
 				for (exp, io) in non_range_indexes {
 					let ie = IteratorEntry::Single(Some(exp), io);
 					let ir = exe.add_iterator(ie);
-					it.ingest(Iterable::Index(t.clone(), ir));
+					it.ingest(Iterable::Index(t.clone(), ir, rs));
 				}
 				for (ixr, rq) in ranges_indexes {
 					let ie = IteratorEntry::Range(rq.exps, ixr, rq.from, rq.to);
 					let ir = exe.add_iterator(ie);
-					it.ingest(Iterable::Index(t.clone(), ir));
+					it.ingest(Iterable::Index(t.clone(), ir, rs));
 				}
 				self.requires_distinct = true;
-				self.add(t.clone(), None, exe, it);
+				self.add(t.clone(), None, exe, it, rs);
 			}
-			Plan::SingleIndexRange(ixn, rq) => {
+			Plan::SingleIndexRange(ixn, rq, keys_only) => {
 				let ir = exe.add_iterator(IteratorEntry::Range(rq.exps, ixn, rq.from, rq.to));
-				self.add(t.clone(), Some(ir), exe, it);
+				self.add(t.clone(), Some(ir), exe, it, keys_only);
 			}
-			Plan::TableIterator(reason, keys_only) => {
+			Plan::TableIterator(reason, rs) => {
 				if let Some(reason) = reason {
 					self.fallbacks.push(reason);
 				}
-				self.add(t.clone(), None, exe, it);
-				it.ingest(Iterable::Table(t, keys_only));
+				self.add(t.clone(), None, exe, it, rs);
+				it.ingest(Iterable::Table(t, rs));
 				is_table_iterator = true;
 			}
 		}
@@ -224,10 +315,11 @@ impl QueryPlanner {
 		irf: Option<IteratorRef>,
 		exe: InnerQueryExecutor,
 		it: &mut Iterator,
+		rs: RecordStrategy,
 	) {
 		self.executors.insert(tb.0.clone(), exe.into());
 		if let Some(irf) = irf {
-			it.ingest(Iterable::Index(tb, irf));
+			it.ingest(Iterable::Index(tb, irf, rs));
 		}
 	}
 	pub(crate) fn has_executors(&self) -> bool {
@@ -246,9 +338,12 @@ impl QueryPlanner {
 		&self.fallbacks
 	}
 
-	#[cfg(not(target_arch = "wasm32"))]
 	pub(crate) fn is_order(&self, irf: &IteratorRef) -> bool {
 		self.orders.contains(irf)
+	}
+
+	pub(crate) fn is_any_specific_permission(&self) -> bool {
+		self.any_specific_permission
 	}
 
 	pub(crate) async fn next_iteration_stage(&self) -> Option<IterationStage> {

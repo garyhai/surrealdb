@@ -108,10 +108,9 @@
 #![doc(html_favicon_url = "https://surrealdb.s3.amazonaws.com/favicon.png")]
 #![doc(html_logo_url = "https://surrealdb.s3.amazonaws.com/icon.png")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(test, deny(warnings))]
 
-#[cfg(all(target_arch = "wasm32", feature = "ml"))]
-compile_error!("The `ml` feature is not supported on the `wasm32` architecture.");
+#[cfg(all(target_family = "wasm", feature = "ml"))]
+compile_error!("The `ml` feature is not supported on Wasm.");
 
 #[macro_use]
 extern crate tracing;
@@ -123,6 +122,7 @@ pub use uuid::Uuid;
 
 #[macro_use]
 mod mac;
+#[allow(hidden_glob_reexports)]
 mod api;
 
 #[doc(hidden)]
@@ -142,10 +142,10 @@ pub mod error {
 
 #[cfg(feature = "protocol-http")]
 #[doc(hidden)]
-pub use api::headers;
+pub use crate::api::headers;
 
 #[doc(inline)]
-pub use api::{
+pub use crate::api::{
 	engine, method, opt,
 	value::{
 		self, Action, Bytes, Datetime, Notification, Number, Object, RecordId, RecordIdKey, Value,
